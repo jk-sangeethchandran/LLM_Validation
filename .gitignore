@@ -1,0 +1,9 @@
+.env
+.venv/
+*.csv
+*.xlsx
+*.log
+.validation_cache/
+validation_outputs/
+__pycache__/
+.idea/
