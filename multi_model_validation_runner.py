@@ -12,15 +12,19 @@ What it does:
    facet-by-facet personality control prompt.
 4. The target model receives:
       - the instructor-generated personality prompt
-      - calibration statistics from the first 120 items
-      - labelled first-120 item examples
-   Then it answers items 121-300.
+      - calibration statistics from the selected training split
+      - labelled training-item examples
+   Then it answers the selected held-out validation items.
+   Prompt Type 2 uses the FPS prompt path and now allows either questionnaire split: 120-180 or 180-120.
 5. Runs all selected instructor × target combinations.
 6. Caches instructor prompts, system prompts, target batches, and OpenAI prompt-cache hints where supported.
-7. Exports Excel/CSV/JSONL results and publication-friendly plots.
+7. Compares human vs LLM answers after reverse coding both sides for trait-direction metrics.
+8. Writes partial_results.jsonl after every successful case so interrupted runs can be resumed and merged.
+9. Exports alignment-focused and mean-deviation Excel/CSV/JSONL results plus publication-friendly plots.
+10. Creates Alignment Scores, Mean Dev, Combo Compare, and Plots sheets.
 
 Install in the same venv:
-    python -m pip install -U pandas numpy scipy scikit-learn matplotlib openpyxl python-dotenv groq openai "openai[realtime]" google-genai
+    python -m pip install -U pandas numpy scipy matplotlib openpyxl python-dotenv groq openai "openai[realtime]" google-genai
 
 Expected files beside this script, unless overridden:
     .env
@@ -28,14 +32,25 @@ Expected files beside this script, unless overridden:
 
 Relevant .env variables:
     OPENAI_API_KEY=...
-    GROQ_API_KEY=...                 # only needed if using llama-3.1-8b-instant
-    GROQ_API_KEY_TUD=...             # optional alternative
-    GEMINI_API_KEY=...               # Google AI Studio / Gemini API key, only needed for Gemma
+    GROQ_API_KEY=...                 # Groq key 1, only needed if using llama-3.1-8b-instant
+    GROQ_API_KEY_2=...               # optional Groq fallback key
+    GROQ_API_KEY_3=...               # optional Groq fallback key
+    GROQ_API_KEY_TUD=...             # optional Groq fallback key
+    GEMINI_API_KEY=...               # Google AI Studio / Gemini API key, only needed for Gemma/Gemini/Live
     GOOGLE_AI_STUDIO_API_KEY=...     # optional alternative env name
     GOOGLE_API_KEY=...               # optional alternative env name
 
-Gemma is called through Google AI Studio / Gemini API using the google-genai SDK,
-not through a local workstation endpoint.
+Optional Groq throttling controls:
+    GROQ_TPM_LIMIT=6000
+    GROQ_TPM_SAFETY=0.95
+    GROQ_MIN_INTERVAL_SECONDS=1
+    GROQ_TOKEN_BUFFER=150
+    GROQ_THROTTLE_ENABLED=1
+    GROQ_KEY_ROTATE_AFTER_SECONDS=120   # rotate Groq key if retry hint is >= this long
+    GROQ_SKIP_OVERSIZE_SLEEP=1           # do not sleep 60s for single requests above current TPM limit
+    GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS=400  # exact FPS script used max_tokens=400 for Llama narrative
+
+Gemma/Gemini models are called through Google AI Studio / Gemini API using the google-genai SDK. Gemini 3.1 Flash Live Preview uses the Gemini Live API text mode.
 """
 
 from __future__ import annotations
@@ -52,6 +67,8 @@ import random
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -66,8 +83,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from scipy.stats import pearsonr, ttest_rel
-from sklearn.metrics import mean_squared_error
+from scipy.stats import pearsonr
 
 try:
     from openpyxl import load_workbook
@@ -85,31 +101,137 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_FILE, override=True)
 
-PROMPT_VERSION = "multi_model_fsp_validation_v2_google_ai_studio_gemma"
+PROMPT_VERSION = "multi_model_validation_v30_google_csv_scores"
 SELECTION_FILE = SCRIPT_DIR / ".validation_model_selection.json"
 CACHE_DIR = SCRIPT_DIR / ".validation_cache"
 OUTPUT_ROOT = SCRIPT_DIR / "validation_outputs"
+RESUME_STATE_FILE = OUTPUT_ROOT / "_latest_resume_state.json"
+PARTIAL_RESULTS_FILENAME = "partial_results.jsonl"
+RUN_MANIFEST_FILENAME = "run_manifest.json"
+CUMULATIVE_COMPARISON_CSV = OUTPUT_ROOT / "combo_summary_cumulative.csv"
 CACHE_DIR.mkdir(exist_ok=True)
 OUTPUT_ROOT.mkdir(exist_ok=True)
 
 DEFAULT_MAX_PARTICIPANTS = 10
 DEFAULT_BATCH_SIZE = 30
+# Llama/Groq as TARGET can exceed the 6000 TPM tier when the persona prompt is long.
+# Smaller target batches keep each single Groq request below the on-demand TPM limit.
+LLAMA_TARGET_BATCH_SIZE = int(os.getenv("LLAMA_TARGET_BATCH_SIZE", "20"))
+# Google target batching:
+# - Gemma target is slow/unreliable on one huge request, so default to 30-item chunks
+#   and run those chunks in parallel to reduce wall-clock time.
+# - Gemini Flash/Flash-Lite can usually handle the full held-out split in one call.
+#
+# Set GEMMA_TARGET_BATCH_SIZE=60 or 120 if you still want larger Gemma chunks.
+# Set GOOGLE_TARGET_PARALLEL=0 if Google AI Studio rate limits parallel calls.
+GEMMA_TARGET_BATCH_SIZE = int(os.getenv("GEMMA_TARGET_BATCH_SIZE", "30"))
+# Gemini Flash/Lite can be fast, but long JSON arrays often truncate when the prompt is large.
+# Default to 30 for reliability; adaptive fallback can split further to 15 if needed.
+GEMINI_FLASH_TARGET_BATCH_SIZE = int(os.getenv("GEMINI_FLASH_TARGET_BATCH_SIZE", os.getenv("GEMINI_TARGET_BATCH_SIZE", "15")))
+GOOGLE_TARGET_PARALLEL = (os.getenv("GOOGLE_TARGET_PARALLEL", "1").strip() != "0")
+GOOGLE_TARGET_MAX_WORKERS = int(os.getenv("GOOGLE_TARGET_MAX_WORKERS", "4"))
+# Google API throttling. If you are on paid Tier 1, raise GOOGLE_RPM_LIMIT in .env.
+# Defaults are no longer hard-coded to the free-tier 5 RPM because that caused unnecessary waiting after billing was enabled.
+GOOGLE_THROTTLE_ENABLED = (os.getenv("GOOGLE_THROTTLE_ENABLED", "1").strip() != "0")
+GOOGLE_RPM_LIMIT = int(os.getenv("GOOGLE_RPM_LIMIT", "60"))
+GOOGLE_RPM_SAFETY = float(os.getenv("GOOGLE_RPM_SAFETY", "0.90"))
+GOOGLE_MIN_INTERVAL_SECONDS = float(os.getenv("GOOGLE_MIN_INTERVAL_SECONDS", "1.0"))
+TARGET_PARSE_RETRIES = int(os.getenv("TARGET_PARSE_RETRIES", "2"))
+# If a Google target batch returns incomplete/truncated JSON, split that batch recursively.
+GOOGLE_ADAPTIVE_BATCH_SPLIT = (os.getenv("GOOGLE_ADAPTIVE_BATCH_SPLIT", "1").strip() != "0")
+GOOGLE_MIN_TARGET_BATCH_SIZE = int(os.getenv("GOOGLE_MIN_TARGET_BATCH_SIZE", "15"))
 DEFAULT_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none").strip() or "none"
 DEFAULT_OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_INSTRUCTOR_MAX_TOKENS = int(os.getenv("INSTRUCTOR_MAX_OUTPUT_TOKENS", "1800"))
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1800"))
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
+GOOGLE_LIVE_TIMEOUT_SECONDS = float(os.getenv("GOOGLE_LIVE_TIMEOUT_SECONDS", "120"))
 DEFAULT_GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1800"))
 
+# Groq/Llama on-demand tiers often fail because of TPM rather than context length.
+# The defaults below are deliberately conservative for the common 6000 TPM on-demand limit.
+# You can tune them in .env if your Groq account has a higher limit.
+GROQ_THROTTLE_ENABLED = (os.getenv("GROQ_THROTTLE_ENABLED", "1").strip() != "0")
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "6000"))
+GROQ_TPM_SAFETY = float(os.getenv("GROQ_TPM_SAFETY", "0.95"))
+GROQ_MIN_INTERVAL_SECONDS = float(os.getenv("GROQ_MIN_INTERVAL_SECONDS", "1.0"))
+GROQ_EST_CHARS_PER_TOKEN = float(os.getenv("GROQ_EST_CHARS_PER_TOKEN", "4.0"))
+GROQ_TOKEN_BUFFER = int(os.getenv("GROQ_TOKEN_BUFFER", "150"))
+GROQ_KEY_ROTATE_AFTER_SECONDS = float(os.getenv("GROQ_KEY_ROTATE_AFTER_SECONDS", "120"))
+GROQ_SKIP_OVERSIZE_SLEEP = (os.getenv("GROQ_SKIP_OVERSIZE_SLEEP", "1").strip() != "0")
+GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS", "400"))
+
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY_TUD") or os.getenv("GROQ_API_KEY") or "").strip()
+
+# Groq key rotation order requested for long daily/quota waits.
+# The runner starts with the first available key and switches at runtime when Groq
+# returns a long retry window, e.g., around 300s / 5 minutes.
+GROQ_API_KEY_ENV_ORDER = ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_TUD"]
+GROQ_API_KEY_ENTRIES = [
+    (name, (os.getenv(name) or "").strip())
+    for name in GROQ_API_KEY_ENV_ORDER
+    if (os.getenv(name) or "").strip()
+]
+GROQ_API_KEY = GROQ_API_KEY_ENTRIES[0][1] if GROQ_API_KEY_ENTRIES else ""
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_AI_STUDIO_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
-TRAIN_ITEMS = list(range(1, 121))
-TEST_ITEMS = list(range(121, 301))
+TRAIN_ITEMS = list(range(1, 181))
+TEST_ITEMS = list(range(181, 301))
 ALL_ITEMS = list(range(1, 301))
 TRAIN_COLS = [f"i{n}" for n in TRAIN_ITEMS]
 TEST_COLS = [f"i{n}" for n in TEST_ITEMS]
 ALL_COLS = [f"i{n}" for n in ALL_ITEMS]
+
+# Questionnaire split options:
+# - 120-180: target sees labelled items 1-120 and answers items 121-300
+# - 180-120: target sees labelled items 1-180 and answers items 181-300
+QUESTIONNAIRE_MODE = "180-120"
+TRAIN_RANGE_LABEL = "items 1-180"
+TEST_RANGE_LABEL = "items 181-300"
+TEST_SCORE_SUFFIX = "120"
+
+def split_config(mode: str) -> tuple[list[int], list[int]]:
+    mode = str(mode or "120-180").strip()
+    if mode == "180-120":
+        return list(range(1, 181)), list(range(181, 301))
+    return list(range(1, 121)), list(range(121, 301))
+
+def questionnaire_mode_description(mode: str) -> str:
+    if str(mode) == "180-120":
+        return "180-120 — target sees labelled items 1-180 and answers items 181-300"
+    return "120-180 — target sees labelled items 1-120 and answers items 121-300"
+
+def configure_questionnaire_split(mode: str) -> str:
+    """Update global train/test split variables before any participant is processed."""
+    global QUESTIONNAIRE_MODE, TRAIN_ITEMS, TEST_ITEMS, TRAIN_COLS, TEST_COLS
+    global TRAIN_KEY, TEST_KEY, TRAIN_DOMAIN_COUNTS, TEST_DOMAIN_COUNTS
+    global TRAIN_RANGE_LABEL, TEST_RANGE_LABEL, TEST_SCORE_SUFFIX
+
+    mode = "180-120" if str(mode).strip() == "180-120" else "120-180"
+    train_items, test_items = split_config(mode)
+
+    QUESTIONNAIRE_MODE = mode
+    TRAIN_ITEMS = train_items
+    TEST_ITEMS = test_items
+    TRAIN_COLS = [f"i{n}" for n in TRAIN_ITEMS]
+    TEST_COLS = [f"i{n}" for n in TEST_ITEMS]
+    TRAIN_RANGE_LABEL = f"items {TRAIN_ITEMS[0]}-{TRAIN_ITEMS[-1]}"
+    TEST_RANGE_LABEL = f"items {TEST_ITEMS[0]}-{TEST_ITEMS[-1]}"
+    TEST_SCORE_SUFFIX = str(len(TEST_ITEMS))
+
+    if "ITEM_KEY_300" in globals():
+        train_set = set(TRAIN_ITEMS)
+        test_set = set(TEST_ITEMS)
+        TRAIN_KEY = [entry for entry in ITEM_KEY_300 if entry[0] in train_set]
+        TEST_KEY = [entry for entry in ITEM_KEY_300 if entry[0] in test_set]
+        TRAIN_DOMAIN_COUNTS = {
+            d: sum(1 for _, domain, _, _, _ in TRAIN_KEY if domain == d)
+            for d in DOMAIN_ORDER
+        }
+        TEST_DOMAIN_COUNTS = {
+            d: sum(1 for _, domain, _, _, _ in TEST_KEY if domain == d)
+            for d in DOMAIN_ORDER
+        }
+    return mode
 
 DOMAIN_ORDER = ["O", "C", "E", "A", "N"]
 DOMAIN_FULL_NAMES = {
@@ -451,10 +573,8 @@ for item_num, domain, facet, reverse, item_text in ITEM_KEY_300:
         FACET_ORDER.append(facet)
     FACET_TO_DOMAIN[facet] = domain
 
-TEST_KEY = [entry for entry in ITEM_KEY_300 if 121 <= entry[0] <= 300]
-TRAIN_KEY = [entry for entry in ITEM_KEY_300 if 1 <= entry[0] <= 120]
-TEST_DOMAIN_COUNTS = {d: sum(1 for item_num, domain, facet, reverse, text in TEST_KEY if domain == d) for d in DOMAIN_ORDER}
-TRAIN_DOMAIN_COUNTS = {d: sum(1 for item_num, domain, facet, reverse, text in TRAIN_KEY if domain == d) for d in DOMAIN_ORDER}
+# Default runtime split is overwritten after the interactive questionnaire-mode selection.
+configure_questionnaire_split(QUESTIONNAIRE_MODE)
 FULL_DOMAIN_COUNTS = {d: sum(1 for item_num, domain, facet, reverse, text in ITEM_KEY_300 if domain == d) for d in DOMAIN_ORDER}
 FULL_FACET_COUNTS = {f: sum(1 for item_num, domain, facet, reverse, text in ITEM_KEY_300 if facet == f) for f in FACET_ORDER}
 
@@ -508,14 +628,35 @@ AVAILABLE_MODELS: Dict[str, ModelSpec] = {
         display="Gemma 4 26B A4B IT",
         provider="google_genai",
         model_id="gemma-4-26b-a4b-it",
-        notes="Google AI Studio / Gemini API via google-genai SDK",
+        notes="Google AI Studio / Gemini API via google-genai",
     ),
     "gemma-4-31b-it": ModelSpec(
         key="gemma-4-31b-it",
         display="Gemma 4 31B IT",
         provider="google_genai",
         model_id="gemma-4-31b-it",
-        notes="Google AI Studio / Gemini API via google-genai SDK",
+        notes="Google AI Studio / Gemini API via google-genai",
+    ),
+    "gemini-2.5-flash": ModelSpec(
+        key="gemini-2.5-flash",
+        display="Gemini 2.5 Flash",
+        provider="google_genai",
+        model_id="gemini-2.5-flash",
+        notes="Google AI Studio / Gemini API; faster target/instructor option",
+    ),
+    "gemini-2.5-flash-lite": ModelSpec(
+        key="gemini-2.5-flash-lite",
+        display="Gemini 2.5 Flash-Lite",
+        provider="google_genai",
+        model_id="gemini-2.5-flash-lite",
+        notes="Google AI Studio / Gemini API; fastest/cheapest target option",
+    ),
+    "gemini-3.1-flash-live-preview": ModelSpec(
+        key="gemini-3.1-flash-live-preview",
+        display="Gemini 3.1 Flash Live Preview",
+        provider="google_live",
+        model_id="gemini-3.1-flash-live-preview",
+        notes="Google Gemini Live API; text-only validation mode",
     ),
     "llama-3.1-8b-instant": ModelSpec(
         key="llama-3.1-8b-instant",
@@ -529,6 +670,8 @@ AVAILABLE_MODELS: Dict[str, ModelSpec] = {
 MIGRATED_DEFAULT_SELECTION = {
     "instructors": ["llama-3.1-8b-instant"],
     "targets": ["gpt-5.4-nano"],
+    "prompt_type": "1",
+    "questionnaire_mode": "120-180",
 }
 
 
@@ -557,6 +700,127 @@ def stable_hash(text: str) -> str:
 
 def slugify(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", text).strip("_").lower()
+
+
+def model_short_name(model_key: str) -> str:
+    """Short readable names for Excel sheet names. Excel sheet names are limited to 31 chars."""
+    aliases = {
+        "gpt-5.4": "gpt54",
+        "gpt-5.4-mini": "gpt54mini",
+        "gpt-5.4-nano": "gpt54nano",
+        "gpt-realtime-1.5": "realtime15",
+        "gemma-4-26b-a4b-it": "gemma26b",
+        "gemma-4-31b-it": "gemma31b",
+        "llama-3.1-8b-instant": "llama31_8b",
+    }
+    return aliases.get(model_key, slugify(model_key)[:12])
+
+
+def excel_safe_sheet_name(raw_name: str, used_names: Optional[set[str]] = None) -> str:
+    """Make an Excel-safe sheet name, preserving as much model identity as possible."""
+    invalid = "[]:*?/\\"
+    cleaned = "".join("_" if ch in invalid else ch for ch in raw_name).strip() or "Sheet"
+    cleaned = cleaned[:31]
+    if used_names is None:
+        return cleaned
+    candidate = cleaned
+    counter = 2
+    while candidate in used_names:
+        suffix = f"_{counter}"
+        candidate = cleaned[: 31 - len(suffix)] + suffix
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def pair_sheet_name(instructor_model: str, target_model: str, used_names: Optional[set[str]] = None) -> str:
+    return excel_safe_sheet_name(
+        f"{model_short_name(instructor_model)}_to_{model_short_name(target_model)}",
+        used_names=used_names,
+    )
+
+
+
+def combo_short_label(selection: Dict[str, List[str]]) -> str:
+    """Build a compact folder label from the selected instructor/target model combination(s)."""
+    instructors = selection.get("instructors", [])
+    targets = selection.get("targets", [])
+    prompt_suffix = f"p{selection.get('prompt_type', '1')}_{selection.get('questionnaire_mode', '120-180').replace('-', 'to')}"
+    pair_labels = [
+        f"{model_short_name(instr)}_to_{model_short_name(targ)}"
+        for instr in instructors
+        for targ in targets
+    ]
+    if len(pair_labels) == 1:
+        return f"{pair_labels[0]}_{prompt_suffix}"
+    if len(pair_labels) <= 3:
+        return "__".join(pair_labels) + f"_{prompt_suffix}"
+    return f"multi_{len(pair_labels)}_combos_{prompt_suffix}"
+
+
+def next_trial_number(output_root: Path = OUTPUT_ROOT) -> int:
+    """Return the next sequential trial number based on existing trial folders."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    max_seen = 0
+    pattern = re.compile(r"^trial_(\d+)_")
+    for child in output_root.iterdir():
+        if not child.is_dir():
+            continue
+        match = pattern.match(child.name)
+        if match:
+            try:
+                max_seen = max(max_seen, int(match.group(1)))
+            except ValueError:
+                pass
+    return max_seen + 1
+
+
+def make_trial_output_dir(selection: Dict[str, List[str]], timestamp: str) -> Path:
+    """Create a folder name that contains the trial number and selected model combo."""
+    trial = next_trial_number(OUTPUT_ROOT)
+    combo = slugify(combo_short_label(selection))[:80] or "model_combo"
+    return OUTPUT_ROOT / f"trial_{trial:03d}_{combo}_{timestamp}"
+
+
+FACET_SHORT_NAMES = {
+    "Anxiety": "Anx",
+    "Friendliness": "Frnd",
+    "Imagination": "Imag",
+    "Trust": "Trst",
+    "Self-Efficacy": "SEff",
+    "Anger": "Ang",
+    "Gregariousness": "Greg",
+    "Artistic Interests": "Art",
+    "Morality": "Mor",
+    "Orderliness": "Ord",
+    "Depression": "Dep",
+    "Assertiveness": "Asrt",
+    "Emotionality": "Emo",
+    "Altruism": "Alt",
+    "Dutifulness": "Duty",
+    "Self-Consciousness": "SelfC",
+    "Activity Level": "Act",
+    "Adventurousness": "Adv",
+    "Cooperation": "Coop",
+    "Achievement-Striving": "Ach",
+    "Immoderation": "Immod",
+    "Excitement-Seeking": "Exc",
+    "Intellect": "Int",
+    "Modesty": "Mod",
+    "Self-Discipline": "SDisc",
+    "Vulnerability": "Vuln",
+    "Cheerfulness": "Cheer",
+    "Liberalism": "Lib",
+    "Sympathy": "Sym",
+    "Cautiousness": "Caut",
+}
+
+
+def facet_short_name(facet: str) -> str:
+    return FACET_SHORT_NAMES.get(facet, re.sub(r"[^A-Za-z0-9]+", "", facet)[:8] or facet[:8])
+
+def facet_alignment_col(facet: str) -> str:
+    return "aligned_facet_" + re.sub(r"[^a-zA-Z0-9]+", "_", facet).strip("_")
 
 
 def load_json_cache(path: Path) -> Dict[str, Any]:
@@ -590,20 +854,26 @@ RAW_TEXT_CACHE = load_json_cache(RAW_TEXT_CACHE_FILE)
 # Selection menu
 # =============================================================================
 
-def load_previous_selection() -> Dict[str, List[str]]:
+def load_previous_selection() -> Dict[str, Any]:
     if SELECTION_FILE.exists():
         try:
             data = json.loads(SELECTION_FILE.read_text(encoding="utf-8"))
             instructors = [m for m in data.get("instructors", []) if m in AVAILABLE_MODELS]
             targets = [m for m in data.get("targets", []) if m in AVAILABLE_MODELS]
+            prompt_type = str(data.get("prompt_type", "1")).strip()
+            if prompt_type not in {"1", "2", "3"}:
+                prompt_type = "1"
+            questionnaire_mode = str(data.get("questionnaire_mode", "120-180")).strip()
+            if questionnaire_mode not in {"120-180", "180-120"}:
+                questionnaire_mode = "120-180"
             if instructors and targets:
-                return {"instructors": instructors, "targets": targets}
+                return {"instructors": instructors, "targets": targets, "prompt_type": prompt_type, "questionnaire_mode": questionnaire_mode}
         except Exception:
             pass
     return MIGRATED_DEFAULT_SELECTION.copy()
 
 
-def save_selection(selection: Dict[str, List[str]]) -> None:
+def save_selection(selection: Dict[str, Any]) -> None:
     SELECTION_FILE.write_text(json.dumps(selection, indent=2), encoding="utf-8")
 
 
@@ -647,7 +917,72 @@ def parse_model_selection(raw: str) -> List[str]:
     return deduped
 
 
-def choose_models_interactively() -> Dict[str, List[str]]:
+def prompt_type_description(prompt_type: str) -> str:
+    pt = str(prompt_type)
+    if pt == "2":
+        return "Prompt Type 2 — FPS prompt path: instructor and target prompts from the uploaded FPS validation script, adapted to chosen split"
+    if pt == "3":
+        return "Prompt Type 3 — FPS instructor + original/current target prompt"
+    return "Prompt Type 1 — current validation system: direct second-person validation prompt"
+
+
+def choose_prompt_type_interactively(selection: Dict[str, Any]) -> Dict[str, Any]:
+    current = str(selection.get("prompt_type", "1")).strip()
+    if current not in {"1", "2", "3"}:
+        current = "1"
+
+    print("\n" + "=" * 86)
+    print("PROMPT TYPE SELECTION — still no participant data is sent before this step")
+    print("=" * 86)
+    print("Current prompt type:", current)
+    print(" ", prompt_type_description(current))
+    print("\nChoose prompt system:")
+    print("  1. Prompt Type 1 — current system")
+    print("     Direct second-person validation prompt generated specifically for the target LLM.")
+    print("  2. Prompt Type 2 — FPS prompt path")
+    print("     Uses the same FPS-style instructor narrative prompt and target adoption prompt; for 180-120, item-range wording is adapted.")
+    print("  3. Prompt Type 3 — FPS instructor + original target prompt")
+    print("     Instructor uses the uploaded FPS-style prompt, but target uses the original/current validation target prompt.")
+
+    raw = input("Prompt type [1/2/3, Enter keeps current]: ").strip()
+    if raw not in {"1", "2", "3"}:
+        raw = current
+    selection["prompt_type"] = raw
+
+    save_selection(selection)
+    print("Using", prompt_type_description(raw))
+    return choose_questionnaire_mode_interactively(selection)
+
+
+def choose_questionnaire_mode_interactively(selection: Dict[str, Any]) -> Dict[str, Any]:
+    current = str(selection.get("questionnaire_mode", "120-180")).strip()
+    if current not in {"120-180", "180-120"}:
+        current = "120-180"
+
+    print("\n" + "=" * 86)
+    print("QUESTIONNAIRE SPLIT SELECTION — still no participant data is sent before this step")
+    print("=" * 86)
+    print("Current questionnaire mode:", current)
+    print(" ", questionnaire_mode_description(current))
+    print("\nChoose questionnaire split:")
+    print("  1. 120-180 — target sees labelled items 1-120 and answers items 121-300")
+    print("  2. 180-120 — target sees labelled items 1-180 and answers items 181-300")
+
+    raw = input("Questionnaire mode [1/2, Enter keeps current]: ").strip()
+    if raw == "2":
+        mode = "180-120"
+    elif raw == "1":
+        mode = "120-180"
+    else:
+        mode = current
+
+    selection["questionnaire_mode"] = mode
+    save_selection(selection)
+    print("Using", questionnaire_mode_description(mode))
+    return selection
+
+
+def choose_models_interactively() -> Dict[str, Any]:
     selection = load_previous_selection()
 
     print("\n" + "=" * 86)
@@ -655,17 +990,19 @@ def choose_models_interactively() -> Dict[str, List[str]]:
     print("=" * 86)
     print("Current chosen instructor model(s):", format_model_list(selection["instructors"]))
     print("Current chosen target model(s)    :", format_model_list(selection["targets"]))
-    print("\nPress 1 to continue with the same choice")
-    print("Press 2 to change choice")
+    print("Current prompt type               :", selection.get("prompt_type", "1"), "-", prompt_type_description(str(selection.get("prompt_type", "1"))))
+    print("Current questionnaire mode        :", selection.get("questionnaire_mode", "120-180"), "-", questionnaire_mode_description(str(selection.get("questionnaire_mode", "120-180"))))
+    print("\nPress 1 to continue with the same model choice")
+    print("Press 2 to change model choice")
     choice = input("Choice: ").strip() or "1"
 
     if choice == "1":
         print("Using previous/current model choice.")
-        return selection
+        return choose_prompt_type_interactively(selection)
 
     if choice != "2":
         print("Unrecognised choice. Using previous/current model choice.")
-        return selection
+        return choose_prompt_type_interactively(selection)
 
     print_model_menu()
     print("\nEnter comma-separated numbers or model IDs. Type 'all' to run every model.")
@@ -675,16 +1012,15 @@ def choose_models_interactively() -> Dict[str, List[str]]:
             instructors = parse_model_selection(instructor_raw)
             target_raw = input("Target model(s): ").strip()
             targets = parse_model_selection(target_raw)
-            new_selection = {"instructors": instructors, "targets": targets}
+            new_selection = {"instructors": instructors, "targets": targets, "prompt_type": str(selection.get("prompt_type", "1")), "questionnaire_mode": str(selection.get("questionnaire_mode", "120-180"))}
             save_selection(new_selection)
             print("\nSaved model choice.")
             print("Instructor model(s):", format_model_list(instructors))
             print("Target model(s)    :", format_model_list(targets))
-            return new_selection
+            return choose_prompt_type_interactively(new_selection)
         except ValueError as e:
             print(f"Selection error: {e}")
             print("Try again.")
-
 
 def ask_max_participants(default: int) -> Optional[int]:
     raw = input(f"How many participants to validate? Press Enter for {default}, or type 'all': ").strip()
@@ -721,24 +1057,32 @@ def validate_environment(selection: Dict[str, List[str]]) -> None:
             missing.append("OPENAI_API_KEY")
     if "groq_chat" in providers:
         if not GROQ_API_KEY:
-            missing.append("GROQ_API_KEY or GROQ_API_KEY_TUD")
-    if "google_genai" in providers:
+            missing.append("GROQ_API_KEY or GROQ_API_KEY_2 or GROQ_API_KEY_3 or GROQ_API_KEY_TUD")
+    if "google_genai" in providers or "google_live" in providers:
         if not GEMINI_API_KEY:
             missing.append("GEMINI_API_KEY or GOOGLE_AI_STUDIO_API_KEY or GOOGLE_API_KEY")
     if missing:
         raise RuntimeError("Missing required environment variable(s): " + ", ".join(missing))
 
-    if "google_genai" in providers:
-        print("\nGemma selected.")
-        print("  Provider: Google AI Studio / Gemini API")
-        print(f"  GEMINI_API_KEY / GOOGLE_AI_STUDIO_API_KEY / GOOGLE_API_KEY = {'set' if GEMINI_API_KEY else 'not set'}")
-        print("  Install dependency if needed: python -m pip install -U google-genai\n")
+    if "google_genai" in providers or "google_live" in providers:
+        print("\nGoogle AI Studio / Gemini API selected for Google/Gemma/Gemini.")
+        print(f"  GEMINI_API_KEY / GOOGLE_AI_STUDIO_API_KEY / GOOGLE_API_KEY = {'set' if GEMINI_API_KEY else 'not set'}\n")
 
 
 _OPENAI_CLIENT = None
 _ASYNC_OPENAI_CLIENT = None
 _GROQ_CLIENT = None
+_GROQ_CLIENT_KEY_NAME: Optional[str] = None
+_GROQ_KEY_INDEX = 0
 _GOOGLE_GENAI_CLIENT = None
+
+_GOOGLE_THROTTLE_LOCK = threading.Lock()
+_GOOGLE_CALL_HISTORY: List[float] = []
+_GOOGLE_LAST_CALL_AT = 0.0
+
+_GROQ_THROTTLE_LOCK = threading.Lock()
+_GROQ_CALL_HISTORY: List[Tuple[float, int, str]] = []
+_GROQ_LAST_CALL_AT = 0.0
 
 
 def get_openai_client():
@@ -757,12 +1101,57 @@ def get_async_openai_client():
     return _ASYNC_OPENAI_CLIENT
 
 
+def get_current_groq_key_entry() -> Tuple[str, str]:
+    if not GROQ_API_KEY_ENTRIES:
+        return "GROQ_API_KEY", ""
+    idx = max(0, min(_GROQ_KEY_INDEX, len(GROQ_API_KEY_ENTRIES) - 1))
+    return GROQ_API_KEY_ENTRIES[idx]
+
+
 def get_groq_client():
-    global _GROQ_CLIENT
-    if _GROQ_CLIENT is None:
+    global _GROQ_CLIENT, _GROQ_CLIENT_KEY_NAME
+    key_name, api_key = get_current_groq_key_entry()
+    if _GROQ_CLIENT is None or _GROQ_CLIENT_KEY_NAME != key_name:
         from groq import Groq
-        _GROQ_CLIENT = Groq(api_key=GROQ_API_KEY, max_retries=0)
+        _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0)
+        _GROQ_CLIENT_KEY_NAME = key_name
     return _GROQ_CLIENT
+
+
+def current_groq_key_name() -> str:
+    return get_current_groq_key_entry()[0]
+
+
+def rotate_groq_key(logger: logging.Logger, reason: str = "") -> bool:
+    """Switch to the next configured Groq key at runtime.
+
+    Used for long retry windows that usually indicate an exhausted daily/token
+    budget on the current key. It clears local TPM history because the next key
+    may have a separate quota window. If keys belong to the same organization,
+    Groq may still enforce shared org limits, but this gives the requested fallback.
+    """
+    global _GROQ_KEY_INDEX, _GROQ_CLIENT, _GROQ_CLIENT_KEY_NAME, _GROQ_CALL_HISTORY, _GROQ_LAST_CALL_AT
+
+    if len(GROQ_API_KEY_ENTRIES) <= 1:
+        return False
+
+    old_name = current_groq_key_name()
+    for step in range(1, len(GROQ_API_KEY_ENTRIES) + 1):
+        candidate_index = (_GROQ_KEY_INDEX + step) % len(GROQ_API_KEY_ENTRIES)
+        candidate_name, _ = GROQ_API_KEY_ENTRIES[candidate_index]
+        if candidate_name != old_name:
+            _GROQ_KEY_INDEX = candidate_index
+            _GROQ_CLIENT = None
+            _GROQ_CLIENT_KEY_NAME = None
+            with _GROQ_THROTTLE_LOCK:
+                _GROQ_CALL_HISTORY = []
+                _GROQ_LAST_CALL_AT = 0.0
+            logger.warning(
+                f"    Groq key switch: {old_name} -> {candidate_name}"
+                + (f" | reason: {reason}" if reason else "")
+            )
+            return True
+    return False
 
 
 def get_google_genai_client():
@@ -771,6 +1160,41 @@ def get_google_genai_client():
         from google import genai
         _GOOGLE_GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
     return _GOOGLE_GENAI_CLIENT
+
+
+def reserve_google_rpm_capacity(logger: logging.Logger, purpose: str) -> None:
+    """Throttle Google AI Studio / Gemini API calls for free-tier RPM limits.
+
+    This prevents rapid repeated requests from hitting errors like:
+    GenerateRequestsPerMinutePerProjectPerModel-FreeTier, quotaValue=5.
+    """
+    global _GOOGLE_LAST_CALL_AT, _GOOGLE_CALL_HISTORY
+    if not GOOGLE_THROTTLE_ENABLED:
+        return
+
+    with _GOOGLE_THROTTLE_LOCK:
+        now = time.time()
+        _GOOGLE_CALL_HISTORY = [t for t in _GOOGLE_CALL_HISTORY if now - t < 60.0]
+
+        waits: List[float] = []
+        since_last = now - _GOOGLE_LAST_CALL_AT if _GOOGLE_LAST_CALL_AT else 999.0
+        if since_last < GOOGLE_MIN_INTERVAL_SECONDS:
+            waits.append(GOOGLE_MIN_INTERVAL_SECONDS - since_last)
+
+        effective_limit = max(1, int(math.floor(GOOGLE_RPM_LIMIT * GOOGLE_RPM_SAFETY)))
+        if len(_GOOGLE_CALL_HISTORY) >= effective_limit:
+            waits.append(max(0.0, 60.0 - (now - min(_GOOGLE_CALL_HISTORY)) + 0.5))
+
+        wait_seconds = max(waits) if waits else 0.0
+        if wait_seconds > 0:
+            logger.info(f"    Google throttle before {purpose}: waiting {wait_seconds:.1f}s "
+                        f"(rpm_limit={GOOGLE_RPM_LIMIT}, recent_calls={len(_GOOGLE_CALL_HISTORY)})")
+            time.sleep(wait_seconds)
+            now = time.time()
+            _GOOGLE_CALL_HISTORY = [t for t in _GOOGLE_CALL_HISTORY if now - t < 60.0]
+
+        _GOOGLE_CALL_HISTORY.append(time.time())
+        _GOOGLE_LAST_CALL_AT = time.time()
 
 
 # =============================================================================
@@ -792,6 +1216,18 @@ def is_temporary_server_error(exc: Exception) -> bool:
     ])
 
 
+def is_realtime_empty_output_error(exc: Exception) -> bool:
+    """OpenAI Realtime can occasionally complete without a text item.
+    Treat it as a transient provider failure and retry the same target batch.
+    """
+    text = str(exc).lower()
+    return (
+        "realtime response completed without text output" in text
+        or "realtime connection closed before response.done" in text
+        or "completed without text output" in text
+    )
+
+
 def safe_get_header(exc: Exception, key: str) -> Optional[str]:
     try:
         response = getattr(exc, "response", None)
@@ -803,6 +1239,26 @@ def safe_get_header(exc: Exception, key: str) -> Optional[str]:
     return None
 
 
+def _parse_retry_after_seconds_from_text(text: str) -> Optional[float]:
+    """Extract Groq-style retry hints such as 'Please try again in 3.5s'."""
+    lowered = (text or "").lower()
+    m = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*s", lowered)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*m\s*([0-9]+(?:\.[0-9]+)?)?\s*s?", lowered)
+    if m:
+        minutes = float(m.group(1))
+        seconds = float(m.group(2) or 0)
+        return minutes * 60 + seconds
+    m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", lowered)
+    if m:
+        return float(m.group(1))
+    m = re.search(r'retrydelay[\'\"]?\s*[:=]\s*[\'\"]?([0-9]+(?:\.[0-9]+)?)s', lowered)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 def compute_retry_delay(exc: Exception, attempt: int, default_base: float = 3.0, default_cap: float = 120.0) -> float:
     retry_after = safe_get_header(exc, "retry-after")
     if retry_after:
@@ -810,8 +1266,117 @@ def compute_retry_delay(exc: Exception, attempt: int, default_base: float = 3.0,
             return max(1.0, float(retry_after))
         except ValueError:
             pass
+
+    parsed = _parse_retry_after_seconds_from_text(str(exc))
+    if parsed is not None:
+        # Add a small cushion so we do not hit the same TPM edge again.
+        return max(1.0, parsed + 1.0)
+
     exponential = min(default_base * (2 ** attempt), default_cap)
     return exponential + random.uniform(0, 1.5)
+
+
+def retry_hint_seconds(exc: Exception) -> Optional[float]:
+    retry_after = safe_get_header(exc, "retry-after")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return _parse_retry_after_seconds_from_text(str(exc))
+
+
+def is_groq_single_request_too_large(exc: Exception) -> bool:
+    """Detect Groq's 413 TPM/request-size error for one oversized request."""
+    text = str(exc).lower()
+    return (
+        ("413" in text and "request too large" in text)
+        or ("requested" in text and "limit" in text and "tokens per minute" in text and "tpm" in text)
+    )
+
+
+def should_rotate_groq_key(exc: Exception) -> bool:
+    if not is_rate_limit_error(exc) and not is_groq_single_request_too_large(exc):
+        return False
+    if is_groq_single_request_too_large(exc):
+        return len(GROQ_API_KEY_ENTRIES) > 1
+    hint = retry_hint_seconds(exc)
+    if hint is None:
+        return False
+    return hint >= GROQ_KEY_ROTATE_AFTER_SECONDS
+
+
+def estimate_groq_requested_tokens(system_prompt: str, user_prompt: str, max_tokens: int) -> int:
+    # This is an intentionally conservative estimate. Groq's error message reports
+    # requested tokens as input tokens + max output allowance.
+    char_count = len(system_prompt or "") + len(user_prompt or "")
+    estimated_input = int(math.ceil(char_count / max(GROQ_EST_CHARS_PER_TOKEN, 1.0)))
+    return estimated_input + int(max_tokens or 0) + GROQ_TOKEN_BUFFER
+
+
+def _prune_groq_history(now: float) -> None:
+    global _GROQ_CALL_HISTORY
+    _GROQ_CALL_HISTORY = [(ts, toks, purpose) for ts, toks, purpose in _GROQ_CALL_HISTORY if now - ts < 60.0]
+
+
+def reserve_groq_tpm_capacity(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    logger: logging.Logger,
+    purpose: str,
+) -> int:
+    """Wait before Groq calls so llama-3.1-8b-instant stays under TPM limits.
+
+    This is proactive throttling. It prevents the repeated 429 pattern where the call is
+    small enough for context but too large for the current 60-second TPM window.
+    """
+    global _GROQ_LAST_CALL_AT
+
+    estimate = estimate_groq_requested_tokens(system_prompt, user_prompt, max_tokens)
+    if not GROQ_THROTTLE_ENABLED:
+        return estimate
+
+    hard_limit = max(1, GROQ_TPM_LIMIT)
+    safe_limit = max(1, int(hard_limit * GROQ_TPM_SAFETY))
+
+    # If one request is itself above the current key/account TPM limit, waiting cannot make
+    # that single request legal on this key. Do not add it to the rolling TPM history and do
+    # not sleep for 60s. Let call_groq_chat try it immediately; on Groq's 413/TPM error,
+    # call_model_text will rotate to the next configured Groq key.
+    effective_limit = max(safe_limit, min(estimate, hard_limit))
+    if estimate > hard_limit:
+        logger.warning(
+            f"    Groq request estimate for {purpose} is {estimate} tokens, above GROQ_TPM_LIMIT={hard_limit}. "
+            "Skipping proactive sleep and trying configured Groq keys immediately. "
+            "If every key has the same TPM limit, this exact Prompt Type 2 Llama request cannot run on Groq on-demand; "
+            "use a higher-limit Groq key, a non-Groq instructor, or Prompt Type 1/3."
+        )
+        return estimate
+
+    while True:
+        with _GROQ_THROTTLE_LOCK:
+            now = time.time()
+            _prune_groq_history(now)
+            used = sum(toks for _, toks, _ in _GROQ_CALL_HISTORY)
+            wait_for_interval = max(0.0, GROQ_MIN_INTERVAL_SECONDS - (now - _GROQ_LAST_CALL_AT))
+
+            wait_for_tokens = 0.0
+            if used + estimate > effective_limit and _GROQ_CALL_HISTORY:
+                oldest_ts = min(ts for ts, _, _ in _GROQ_CALL_HISTORY)
+                wait_for_tokens = max(0.0, 60.0 - (now - oldest_ts) + 0.75)
+
+            wait_seconds = max(wait_for_interval, wait_for_tokens)
+            if wait_seconds <= 0.0:
+                _GROQ_CALL_HISTORY.append((now, estimate, purpose))
+                _GROQ_LAST_CALL_AT = now
+                return estimate
+
+        logger.info(
+            f"    Groq throttle before {purpose}: waiting {wait_seconds:.1f}s "
+            f"(estimated_request={estimate}, recent_used={used}, safe_limit={effective_limit})"
+        )
+        time.sleep(wait_seconds)
 
 
 def extract_json_candidate(text: str) -> str:
@@ -837,18 +1402,104 @@ def extract_json_candidate(text: str) -> str:
     return candidates[0]
 
 
-def parse_scores_json(raw_text: str, expected_n: int) -> List[int]:
-    snippet = extract_json_candidate(raw_text)
-    parsed = json.loads(snippet)
+def parse_scores_from_incomplete_text(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
+    """Recover score lists from incomplete/truncated JSON-like model output.
+
+    This is mainly for Gemini/Gemma target calls where the text can look like
+    {"scores": [5, 4, ... without a closing bracket. We only recover numeric
+    score values (1-5), and we never use item text.
+    """
+    text = raw_text or ""
+    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else []
+
+    # Preferred Google target format in v30: plain comma-separated scores, e.g. 3,4,1,5.
+    # Accept it only when the text is almost entirely score punctuation, avoiding prose.
+    csv_like = text.strip()
+    csv_values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', csv_like)]
+    csv_noise = re.sub(r"[1-5,;\\s\\n\\r\\t`\\[\\]{}()\"']", '', csv_like)
+    if len(csv_values) >= expected_n and len(csv_noise) <= 8:
+        return csv_values[:expected_n]
+
+    if requested_items:
+        pairs = re.findall(r'["\']?([0-9]{1,3})["\']?\s*:\s*([1-5])(?=\D|$)', text)
+        by_key = {int(k): int(v) for k, v in pairs}
+        if all(item in by_key for item in requested_items):
+            return [by_key[item] for item in requested_items]
+
+    lowered = text.lower()
+    idx = lowered.find("scores")
+    if idx != -1:
+        tail = text[idx:]
+        values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', tail)]
+        if len(values) >= expected_n:
+            return values[:expected_n]
+
+    # Last resort only for outputs that appear to be pure score material, not prose.
+    compact = re.sub(r'[`\s,\[\]{}:"scoresA-Za-z_/-]', '', text)
+    values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', text)]
+    if len(values) >= expected_n and len(compact) <= expected_n * 2 + 10:
+        return values[:expected_n]
+
+    raise ValueError(f"Could not recover {expected_n} scores from incomplete output: {text[:250]}")
+
+
+def parse_scores_json(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
+    """Parse target-model questionnaire scores robustly.
+
+    Preferred output is either {"scores": [...]} or a raw JSON array.
+    Also accepts item-number keyed objects such as {"181": 5, "182": 4}.
+    If a model returns too many pure score values, the parser takes the first
+    expected_n values rather than failing the whole case. This is mainly for
+    Google/Gemma models that sometimes append extra score-like values after
+    the requested JSON.
+    """
+    try:
+        snippet = extract_json_candidate(raw_text)
+        parsed = json.loads(snippet)
+    except Exception:
+        return parse_scores_from_incomplete_text(raw_text, expected_n, item_numbers=item_numbers)
+
+    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else None
+
+    scores = None
+
     if isinstance(parsed, dict):
-        scores = parsed.get("scores")
+        raw_scores = parsed.get("scores")
+
+        if isinstance(raw_scores, list):
+            scores = raw_scores
+
+        if scores is None:
+            numeric_items = []
+            for key, value in parsed.items():
+                key_text = str(key).strip()
+                if key_text.isdigit():
+                    numeric_items.append((int(key_text), value))
+
+            if requested_items:
+                by_key = {k: v for k, v in numeric_items}
+                if all(item in by_key for item in requested_items):
+                    scores = [by_key[item] for item in requested_items]
+
+            if scores is None and numeric_items:
+                numeric_items.sort(key=lambda kv: kv[0])
+                if len(numeric_items) >= expected_n:
+                    scores = [value for _, value in numeric_items[:expected_n]]
+
     elif isinstance(parsed, list):
         scores = parsed
     else:
-        raise ValueError("JSON output must be a scores object or array.")
+        raise ValueError("JSON output must be a scores object, item-keyed object, or array.")
 
     if not isinstance(scores, list):
-        raise ValueError(f"JSON output missing scores list: {str(parsed)[:250]}")
+        raise ValueError(f"JSON output missing scores list or item-number keyed scores: {str(parsed)[:250]}")
+
+    # If the model returned more score values than requested, keep only the ordered
+    # requested scores. This prevents long Google/Gemma calls from being discarded
+    # when the model appends accidental extra values after the valid answer.
+    if len(scores) > expected_n:
+        scores = scores[:expected_n]
+
     if len(scores) != expected_n:
         raise ValueError(f"Expected {expected_n} scores, got {len(scores)}.")
 
@@ -856,6 +1507,8 @@ def parse_scores_json(raw_text: str, expected_n: int) -> List[int]:
     for value in scores:
         if isinstance(value, str) and value.strip().isdigit():
             value = int(value.strip())
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
         if not isinstance(value, int) or value < 1 or value > 5:
             raise ValueError(f"Invalid score value: {value} in {scores}")
         clean_scores.append(value)
@@ -944,6 +1597,8 @@ def call_model_text(
             logger.info(f"    raw text cache hit: {purpose} | {spec.key}")
             return cached
 
+    groq_oversize_tried_keys: set[str] = set()
+
     for attempt in range(8):
         try:
             if spec.provider == "openai_responses":
@@ -954,6 +1609,8 @@ def call_model_text(
                 text = call_groq_chat(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
             elif spec.provider == "google_genai":
                 text = call_google_genai(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
+            elif spec.provider == "google_live":
+                text = asyncio.run(call_google_live_text(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores))
             else:
                 raise RuntimeError(f"Unsupported provider: {spec.provider}")
 
@@ -963,6 +1620,57 @@ def call_model_text(
             return text
 
         except Exception as e:
+            if spec.provider == "groq_chat" and is_groq_single_request_too_large(e):
+                failed_key = current_groq_key_name()
+                groq_oversize_tried_keys.add(failed_key)
+                if len(groq_oversize_tried_keys) < len(GROQ_API_KEY_ENTRIES):
+                    switched = rotate_groq_key(
+                        logger,
+                        reason=f"single Groq request too large on {failed_key} during {purpose}",
+                    )
+                    if switched:
+                        logger.warning(
+                            f"    retry {attempt + 1} for {purpose} | {spec.key}: {failed_key} rejected the single request; "
+                            f"trying {current_groq_key_name()} immediately without 60s sleep"
+                        )
+                        time.sleep(0.25)
+                        continue
+                raise RuntimeError(
+                    f"Groq rejected this single request as larger than the TPM/request limit for all tried keys "
+                    f"({', '.join(sorted(groq_oversize_tried_keys))}). Waiting will not fix this. "
+                    f"For exact Prompt Type 2 with Llama as instructor, use a Groq key/org with a higher TPM limit, "
+                    f"lower GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS, switch to Prompt Type 1/3, or use GPT/Gemini as instructor. "
+                    f"Original error: {repr(e)}"
+                ) from e
+
+            if spec.provider == "groq_chat" and should_rotate_groq_key(e):
+                hint = retry_hint_seconds(e)
+                switched = rotate_groq_key(
+                    logger,
+                    reason=f"long Groq retry hint {hint:.1f}s during {purpose}" if hint is not None else f"Groq rate limit during {purpose}",
+                )
+                if switched:
+                    if hint is not None:
+                        logger.warning(
+                            f"    retry {attempt + 1} for {purpose} | {spec.key}: switched to {current_groq_key_name()} instead of waiting {hint:.1f}s"
+                        )
+                    else:
+                        logger.warning(
+                            f"    retry {attempt + 1} for {purpose} | {spec.key}: switched to {current_groq_key_name()}"
+                        )
+                    time.sleep(1.0)
+                    continue
+
+            if is_realtime_empty_output_error(e):
+                # This is usually a transient Realtime API completion issue, not a bad score.
+                # Retry the same target batch; do not fail the whole case immediately.
+                delay = min(2.0 + attempt * 1.5, 10.0) + random.uniform(0, 0.5)
+                logger.warning(
+                    f"    retry {attempt + 1} for {purpose} | {spec.key} after empty Realtime output | waiting {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
+
             if is_rate_limit_error(e) or is_temporary_server_error(e):
                 delay = compute_retry_delay(e, attempt)
                 logger.warning(f"    retry {attempt + 1} for {purpose} | {spec.key} after error: {repr(e)} | waiting {delay:.1f}s")
@@ -983,24 +1691,26 @@ def call_openai_responses(
     expected_scores: Optional[int],
 ) -> str:
     client = get_openai_client()
+    input_items = []
+    if system_prompt and system_prompt.strip():
+        input_items.append({
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_text", "text": system_prompt}],
+        })
+    input_items.append({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": user_prompt}],
+    })
+
     kwargs: Dict[str, Any] = {
         "model": spec.model_id,
         "temperature": 0,
         "max_output_tokens": max_tokens,
         "prompt_cache_key": stable_hash(system_prompt),
         "prompt_cache_retention": "24h",
-        "input": [
-            {
-                "type": "message",
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            },
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": user_prompt}],
-            },
-        ],
+        "input": input_items,
     }
     if DEFAULT_REASONING_EFFORT.lower() not in {"", "none-disabled", "disabled"}:
         kwargs["reasoning"] = {"effort": DEFAULT_REASONING_EFFORT}
@@ -1037,18 +1747,15 @@ async def call_openai_realtime(
                 "conversation": "none",
                 "output_modalities": ["text"],
                 "max_output_tokens": max_tokens,
-                "input": [
-                    {
-                        "type": "message",
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": system_prompt}],
-                    },
-                    {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_prompt}],
-                    },
-                ],
+                "input": ([{
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                }] if system_prompt and system_prompt.strip() else []) + [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                }],
             }
         )
 
@@ -1100,10 +1807,10 @@ def call_groq_chat(
     expected_scores: Optional[int],
 ) -> str:
     client = get_groq_client()
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
     kwargs: Dict[str, Any] = {
         "model": spec.model_id,
         "messages": messages,
@@ -1112,6 +1819,15 @@ def call_groq_chat(
     }
     if expected_scores is not None:
         kwargs["response_format"] = {"type": "json_object"}
+
+    estimated_tokens = reserve_groq_tpm_capacity(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=max_tokens,
+        logger=logger,
+        purpose=purpose,
+    )
+    logger.info(f"    Groq call {purpose} | key={current_groq_key_name()} | estimated_request_tokens={estimated_tokens}")
 
     try:
         response = client.chat.completions.create(**kwargs)
@@ -1129,22 +1845,6 @@ def call_groq_chat(
     return text.strip()
 
 
-def build_gemini_scores_schema(n: int) -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "scores": {
-                "type": "array",
-                "items": {"type": "integer", "minimum": 1, "maximum": 5},
-                "minItems": n,
-                "maxItems": n,
-            }
-        },
-        "required": ["scores"],
-        "additionalProperties": False,
-    }
-
-
 def call_google_genai(
     spec: ModelSpec,
     system_prompt: str,
@@ -1154,73 +1854,161 @@ def call_google_genai(
     max_tokens: int,
     expected_scores: Optional[int],
 ) -> str:
-    """Call Gemma through Google AI Studio / Gemini API.
+    """Call Gemma through Google AI Studio / Gemini API using the google-genai SDK."""
+    client = get_google_genai_client()
+    from google.genai import types
 
-    This replaces the earlier local OpenAI-compatible Gemma path. It uses the
-    google-genai SDK with system_instruction and contents, matching the hosted
-    Google AI Studio flow rather than a workstation server.
+    if expected_scores is not None:
+        # Google/Gemini sometimes truncates or malforms JSON arrays when response_mime_type=application/json
+        # is used with a very long system/personality prompt. For score-only target batches, plain CSV
+        # is more reliable and still contains ONLY numeric scores. The local parser validates count/order.
+        prompt = (
+            f"{user_prompt}\n\n"
+            "IMPORTANT OUTPUT FORMAT OVERRIDE FOR THIS API CALL:\n"
+            f"Return exactly {expected_scores} numeric scores and nothing else.\n"
+            "Use this exact plain format: 3,4,1,5,2\n"
+            "Do NOT return JSON. Do NOT include brackets. Do NOT include item numbers. "
+            "Do NOT include item text. Do NOT include explanations, markdown, bullets, or labels.\n"
+            f"There must be exactly {expected_scores} integers, each from 1 to 5, in the same order as the items above."
+        )
+        config = types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=max(max_tokens, expected_scores * 16 + 256),
+            system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+        )
+    else:
+        prompt = user_prompt
+        config = types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=max_tokens,
+            system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+        )
+
+    reserve_google_rpm_capacity(logger, purpose)
+
+    response = client.models.generate_content(
+        model=spec.model_id,
+        contents=prompt,
+        config=config,
+    )
+
+    text = getattr(response, "text", None)
+    if not text:
+        # Last-resort parser for SDK versions that expose candidates/parts.
+        try:
+            chunks = []
+            for cand in getattr(response, "candidates", []) or []:
+                content = getattr(cand, "content", None)
+                for part in getattr(content, "parts", []) or []:
+                    piece = getattr(part, "text", None)
+                    if piece:
+                        chunks.append(piece)
+            text = "".join(chunks).strip()
+        except Exception:
+            text = ""
+    if not text:
+        raise RuntimeError("Google AI Studio / Gemini API returned empty text.")
+    return text.strip()
+
+
+
+
+async def call_google_live_text(
+    spec: ModelSpec,
+    system_prompt: str,
+    user_prompt: str,
+    logger: logging.Logger,
+    purpose: str,
+    max_tokens: int,
+    expected_scores: Optional[int],
+) -> str:
+    """Call Gemini 3.1 Flash Live Preview through the Gemini Live API in TEXT mode.
+
+    The Live model is not a normal generate_content model. Google documents it as
+    a WebSocket Live API model, so this function opens one short-lived text-only
+    Live session per validation call, sends the full prompt as one turn, collects
+    text chunks, then closes the session.
+
+    For validation, this is usable as an experimental comparison model, but it is
+    generally less efficient than Gemini Flash/Flash-Lite for batch questionnaire scoring.
     """
     client = get_google_genai_client()
     from google.genai import types
 
-    base_config_kwargs: Dict[str, Any] = {
-        "system_instruction": system_prompt,
-        "temperature": 0,
-        "max_output_tokens": max_tokens,
-    }
-
     if expected_scores is not None:
-        # JSON mode for score batches. The prompt still asks for {"scores": [...]}
-        # and parse_scores_json verifies length/range before caching.
-        base_config_kwargs["response_mime_type"] = "application/json"
-        base_config_kwargs["response_schema"] = build_gemini_scores_schema(expected_scores)
-
-    def _generate(config_kwargs: Dict[str, Any]) -> Any:
-        config = types.GenerateContentConfig(**config_kwargs)
-        return client.models.generate_content(
-            model=spec.model_id,
-            contents=user_prompt,
-            config=config,
+        user_prompt = (
+            f"{user_prompt}\n\n"
+            f"Return only score values for the requested items. "
+            f"Preferred format: {{\"scores\": [integer, integer, ...]}} with exactly {expected_scores} integers from 1 to 5. "
+            f"Do not include item text, item numbers, explanations, markdown, or comments."
         )
 
+    if system_prompt and system_prompt.strip():
+        full_prompt = (
+            "SYSTEM INSTRUCTIONS FOR THIS VALIDATION CASE:\n"
+            f"{system_prompt}\n\n"
+            "USER REQUEST:\n"
+            f"{user_prompt}"
+        )
+    else:
+        full_prompt = user_prompt
+
+    # Live API uses a WebSocket session. Keep the same local throttle bucket as
+    # other Google calls so the runner does not exceed project RPM when many
+    # cases are run in sequence.
+    reserve_google_rpm_capacity(logger, purpose)
+
+    async def _run_live_request() -> str:
+        chunks: List[str] = []
+        config = {"response_modalities": ["TEXT"]}
+
+        async with client.aio.live.connect(model=spec.model_id, config=config) as session:
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=full_prompt)],
+                ),
+                turn_complete=True,
+            )
+
+            async for msg in session.receive():
+                direct_text = getattr(msg, "text", None)
+                if direct_text:
+                    chunks.append(str(direct_text))
+
+                server_content = getattr(msg, "server_content", None)
+                if server_content is not None:
+                    output_transcription = getattr(server_content, "output_transcription", None)
+                    if output_transcription is not None:
+                        transcript_text = getattr(output_transcription, "text", None)
+                        if transcript_text:
+                            chunks.append(str(transcript_text))
+
+                    model_turn = getattr(server_content, "model_turn", None)
+                    if model_turn is not None:
+                        for part in getattr(model_turn, "parts", []) or []:
+                            part_text = getattr(part, "text", None)
+                            if part_text:
+                                chunks.append(str(part_text))
+
+                    if getattr(server_content, "turn_complete", False):
+                        break
+
+                if getattr(msg, "turn_complete", False):
+                    break
+
+        return "".join(chunks).strip()
+
     try:
-        response = _generate(dict(base_config_kwargs))
-    except Exception as e:
-        # Some google-genai versions or individual models may reject response_schema.
-        # Fall back to JSON MIME mode without schema; parse_scores_json still validates.
-        message = str(e).lower()
-        if expected_scores is not None and (
-            "response_schema" in message
-            or "responseschema" in message
-            or "schema" in message
-            or "unknown field" in message
-            or "unsupported" in message
-        ):
-            logger.warning("    Google GenAI schema config rejected; retrying with JSON MIME only.")
-            fallback_kwargs = dict(base_config_kwargs)
-            fallback_kwargs.pop("response_schema", None)
-            response = _generate(fallback_kwargs)
-        else:
-            raise
-
-    text = getattr(response, "text", None)
-    if not text:
-        try:
-            chunks = []
-            for candidate in getattr(response, "candidates", []) or []:
-                content = getattr(candidate, "content", None)
-                for part in getattr(content, "parts", []) or []:
-                    part_text = getattr(part, "text", None)
-                    if part_text:
-                        chunks.append(part_text)
-            text = "".join(chunks).strip()
-        except Exception:
-            text = ""
+        text = await asyncio.wait_for(_run_live_request(), timeout=GOOGLE_LIVE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(
+            f"Gemini Live API timed out after {GOOGLE_LIVE_TIMEOUT_SECONDS:.1f}s during {purpose}."
+        ) from e
 
     if not text:
-        raise RuntimeError("Google GenAI returned empty text.")
+        raise RuntimeError("Gemini Live API returned empty text.")
     return text.strip()
-
 
 # =============================================================================
 # Scoring and prompt building
@@ -1289,6 +2077,33 @@ def compute_domain_avgs_from_scores(scores: Sequence[int], key_entries: Sequence
     return {domain: round(totals[domain] / counts[domain], 4) for domain in DOMAIN_ORDER}
 
 
+def compute_facet_avgs_from_scores(scores: Sequence[int], key_entries: Sequence[Tuple[int, str, str, bool, str]], base_item: int) -> Dict[str, Optional[float]]:
+    """Facet mean scores for a train/test split after applying the official reverse-scoring key."""
+    totals = {facet: 0 for facet in FACET_ORDER}
+    counts = {facet: 0 for facet in FACET_ORDER}
+    for item_num, domain, facet, reverse, item_text in key_entries:
+        idx = item_num - base_item
+        if 0 <= idx < len(scores):
+            totals[facet] += score_item(scores[idx], reverse)
+            counts[facet] += 1
+    return {
+        facet: round(totals[facet] / counts[facet], 4) if counts[facet] else None
+        for facet in FACET_ORDER
+    }
+
+
+def score_sequence_by_items(scores: Sequence[int], items: Sequence[int]) -> List[int]:
+    """Return trait-direction scores for the given items, applying reverse coding where needed.
+
+    The target LLM still answers raw Likert values. Validation comparisons use this
+    reverse-coded version for both human and model scores, so alignment scores operate on the personality-direction scale.
+    """
+    scored: List[int] = []
+    for idx, item_num in enumerate(items):
+        scored.append(score_item(scores[idx], ITEM_TO_REVERSE[item_num]))
+    return scored
+
+
 def compute_facet_avgs_from_row(row: pd.Series) -> Dict[str, float]:
     totals = {facet: 0 for facet in FACET_ORDER}
     counts = {facet: 0 for facet in FACET_ORDER}
@@ -1347,6 +2162,7 @@ def build_profile_summary(row: pd.Series) -> Dict[str, Any]:
 
 
 def build_instructor_evidence(row: pd.Series) -> str:
+    """Detailed item-level evidence. Useful for high-token instructor models only."""
     profile = build_profile_summary(row)
     facet_blocks: List[str] = []
 
@@ -1371,43 +2187,204 @@ def build_instructor_evidence(row: pd.Series) -> str:
     return profile["summary_text"] + "\n\nDETAILED FACET EVIDENCE FROM ALL 300 ITEMS\n\n" + "\n\n".join(facet_blocks)
 
 
-def build_instructor_user_prompt(row: pd.Series) -> str:
-    evidence = build_instructor_evidence(row)
+def build_compact_instructor_evidence(row: pd.Series) -> str:
+    """Compact evidence for rate-limited instructor models such as Groq on-demand Llama.
+
+    This uses all 300 questionnaire responses after official reverse scoring, but it sends
+    only aggregate OCEAN/facet summaries rather than all item-level evidence. This keeps
+    the request under small TPM limits while preserving the validation signal needed to
+    generate a detailed facet-by-facet control prompt.
+    """
+    profile = build_profile_summary(row)
+    dist = summarize_scale_distribution(get_scores(row, ALL_ITEMS))
+    ocean_avgs = profile["ocean_avgs"]
+    facet_avgs = profile["facet_avgs"]
+    highest = profile["highest_facets"]
+    lowest = profile["lowest_facets"]
+
+    ocean_lines = [
+        f"- {DOMAIN_FULL_NAMES[d]} ({d}): {ocean_avgs[d]:.3f} / 5"
+        for d in DOMAIN_ORDER
+    ]
+    facet_lines = [
+        f"- {facet} ({FACET_TO_DOMAIN[facet]}): {facet_avgs[facet]:.3f} / 5 = {facet_level_label(facet_avgs[facet])}"
+        for facet in FACET_ORDER
+    ]
+    highest_lines = [f"- {facet}: {score:.3f}" for facet, score in highest]
+    lowest_lines = [f"- {facet}: {score:.3f}" for facet, score in lowest]
+    distribution_lines = [f"- raw score {score}: {dist['counts'][score]} of 300" for score in range(1, 6)]
+
+    return "\n".join([
+        "COMPACT FULL-PROFILE EVIDENCE FROM ALL 300 IPIP-NEO RESPONSES",
+        "The values below are computed from the official item key with reverse scoring applied where required.",
+        f"Overall raw-response mean: {dist['mean']} | variance: {dist['variance']}",
+        f"Neutral usage: {dist['neutral_pct']}% | extreme usage: {dist['extreme_pct']}% | low-end usage: {dist['low_pct']}% | high-end usage: {dist['high_pct']}%",
+        "Raw response distribution:",
+        *distribution_lines,
+        "OCEAN domain averages:",
+        *ocean_lines,
+        "Highest facets:",
+        *highest_lines,
+        "Lowest facets:",
+        *lowest_lines,
+        "All 30 facet averages:",
+        *facet_lines,
+    ])
+
+
+def build_instructor_user_prompt_type1(row: pd.Series, compact: bool = False) -> str:
+    evidence = build_compact_instructor_evidence(row) if compact else build_instructor_evidence(row)
+    compact_note = (
+        "The evidence is compact aggregate evidence, not item-level evidence. "
+        "Still produce a detailed facet-by-facet target prompt from the OCEAN and facet profile.\n\n"
+        if compact else ""
+    )
     return (
-        "Convert the questionnaire evidence below into a detailed personality control prompt for a target LLM.\n\n"
-        "Output requirements:\n"
-        "1. Write in second person, as instructions for a model to temporarily adopt this personality.\n"
-        "2. Include a concise natural overview.\n"
-        "3. Include exactly one behavioural line for each of the 30 facets.\n"
-        "4. Include response-style calibration: how strongly or moderately this person uses 1, 2, 3, 4, and 5-style answers.\n"
+        "Convert the questionnaire evidence below into a SECOND-PERSON personality control prompt for a target LLM.\n\n"
+        f"{compact_note}"
+        "The final prompt you write will be given directly to the target LLM. Therefore, write as if you are speaking to the target LLM itself.\n"
+        "Use direct second-person wording throughout: 'you are this person', 'you take this personality', 'you enjoy...', 'you tend to...', 'you behave...', 'you avoid...', 'you respond...'.\n\n"
+        "Required structure for your output:\n"
+        "1. Start with a clear adoption line similar to: 'For this validation task, you are this person and you take on this personality as your own.'\n"
+        "2. Write a concise natural overview in second person: how you think, speak, feel, interact, decide, cooperate, resist, and regulate yourself.\n"
+        "3. Include exactly one behavioural line for each of the 30 facets, each written as a direct 'you' instruction.\n"
+        "4. Include response-style calibration: how strongly or moderately you use 1, 2, 3, 4, and 5-style answers.\n"
         "5. Include guardrails that prevent exaggeration, especially around warmth, trust, artistry, emotional depth, ambition, caution, and cooperation.\n"
         "6. Do not mention IPIP, Big Five, OCEAN, questionnaire, dataset, item numbers, scoring, labels, or hidden answers in the final prompt.\n"
         "7. Preserve intensity carefully. Do not convert moderate tendencies into extreme ones.\n"
-        "8. Make the output directly usable as a system/developer prompt for a target model.\n\n"
+        "8. Make the output directly usable as a system/developer prompt for a target model.\n"
+        "9. End with a short testing instruction in second person: when you take the next questionnaire items, answer based on the personality you have now, not by predicting hidden data.\n"
+        "10. Keep the output concise enough for repeated validation calls: aim for 900-1300 words.\n\n"
         "Evidence:\n"
         f"{evidence}"
     )
 
 
-def build_instructor_system_prompt() -> str:
+def build_instructor_user_prompt_type2(row: pd.Series, compact: bool = False) -> str:
+    """Exact FPS-method instructor prompt from the uploaded/pasted FPS method script.
+
+    Prompt Type 2 intentionally mirrors the original FPS script's instructor prompt:
+    all 300 raw questionnaire responses are grouped by facet, translated to the
+    same intensity labels, and passed into the same second-person narrative request.
+
+    This function intentionally ignores the compact flag. With a 6000 TPM Groq
+    on-demand limit, Llama may reject this exact prompt because the request itself
+    can exceed the minute token limit.
+    """
+    all_scores = [normalize_raw_score(row.get(f"i{n}", 3)) for n in range(1, 301)]
+
+    facet_data: Dict[str, List[Tuple[str, int]]] = {}
+    for item_num, raw_score in zip(range(1, 301), all_scores):
+        facet = ITEM_TO_FACET[item_num]
+        item_text = ITEM_TO_TEXT[item_num]
+        facet_data.setdefault(facet, []).append((item_text, raw_score))
+
+    score_label = {
+        1: "almost never / strongly disagree",
+        2: "rarely / slightly disagree",
+        3: "sometimes / neutral",
+        4: "often / slightly agree",
+        5: "almost always / strongly agree",
+    }
+
+    ocean_sections = {
+        'N': 'Emotional Tendencies',
+        'E': 'Social and Energetic Style',
+        'O': 'Curiosity and Openness to Experience',
+        'A': 'Interpersonal Style and Values',
+        'C': 'Work Style and Self-Regulation',
+    }
+
+    facet_block = ""
+    for ocean_dim, section_title in ocean_sections.items():
+        facet_block += f"\n=== {section_title} ===\n"
+        for facet in FACET_ORDER:
+            dim = FACET_TO_DOMAIN[facet]
+            if dim != ocean_dim:
+                continue
+            if facet not in facet_data:
+                continue
+            items_in_facet = facet_data[facet]
+            avg_score = sum(s for _, s in items_in_facet) / len(items_in_facet)
+            avg_label = score_label[round(avg_score)]
+            sorted_items = sorted(items_in_facet, key=lambda x: x[1])
+            facet_block += f"\n[{facet}] — overall level: {avg_label}\n"
+            for item_text, score in sorted_items:
+                facet_block += f'  - "{item_text}" → {score_label.get(score, "neutral")}\n'
+
+    prompt = (
+        f"Based on the following questionnaire responses, write a detailed "
+        f"second-person personality description."
+        f"For each behaviour described,"
+        f"be very specific about the INTENSITY and FREQUENCY — use words like "
+        f"'always', 'almost never', 'strongly', 'slightly', 'rarely', "
+        f"'consistently', 'occasionally' to preserve exactly how strongly "
+        f"each trait and facet applies. For example, do not say 'I am social' — instead "
+        f"say 'I almost always feel energised around people and very strongly "
+        f"prefer being in groups over being alone'. The intensity words must "
+        f"map clearly to these levels: "
+        f"'almost never / strongly disagree' = level 1, "
+        f"'rarely / slightly disagree' = level 2, "
+        f"'sometimes / neutral' = level 3, "
+        f"'often / slightly agree' = level 4, "
+        f"'almost always / strongly agree' = level 5. "
+        f"Do NOT mention any personality frameworks, trait names, OCEAN, "
+        f"Big Five, scores, or psychological terminology, but mention facets if necessary"
+        f"Write as natural flowing prose."
+        f"{facet_block}"
+    )
+    return prompt
+
+
+def build_instructor_user_prompt(row: pd.Series, compact: bool = False, prompt_type: str = "1") -> str:
+    # Prompt Type 2 and Type 3 both use the uploaded FPS-style instructor prompt.
+    # Type 2 pairs it with the FPS-style target prompt.
+    # Type 3 pairs it with the original/current validation target prompt.
+    if str(prompt_type) in {"2", "3"}:
+        return build_instructor_user_prompt_type2(row, compact=compact)
+    return build_instructor_user_prompt_type1(row, compact=compact)
+
+
+def build_instructor_system_prompt(prompt_type: str = "1") -> str:
+    if str(prompt_type) == "2":
+        # The uploaded FPS script sends the instructor prompt as a user-only prompt.
+        # Empty system prompt allows provider wrappers to omit the system message.
+        return ""
+    if str(prompt_type) == "3":
+        return (
+            "You are a careful personality narrative generator for validation experiments. "
+            "Follow the FPS validation style: write a detailed second-person personality description, "
+            "preserve intensity and frequency precisely, and avoid mentioning tests, scores, Big Five, OCEAN, hidden labels, or datasets. "
+            "Do not exaggerate. Do not invent biography, job, life history, preferences, trauma, culture, or demographic details. "
+            "Keep nearby concepts separate: imagination is not artistic devotion; intellect is not emotional depth; "
+            "trust is not sympathy; dutifulness is not ambition; cooperation is not friendliness."
+        )
     return (
         "You are a careful personality-prompt generator for validation experiments. "
         "Your job is to transform structured questionnaire evidence into a faithful, restrained, "
-        "facet-specific personality control prompt. Preserve nuance. Do not exaggerate. "
-        "Do not invent biography, job, life history, preferences, trauma, culture, or demographic details. "
+        "facet-specific personality control prompt written directly to a target LLM in second person. "
+        "The target prompt must tell the model: you are this person, you take this personality, "
+        "you behave this way, and you answer later questionnaire items from inside this adopted personality. "
+        "Preserve nuance. Do not exaggerate. Do not invent biography, job, life history, preferences, trauma, culture, or demographic details. "
         "Keep nearby concepts separate: imagination is not artistic devotion; intellect is not emotional depth; "
         "trust is not sympathy; dutifulness is not ambition; cooperation is not friendliness."
     )
 
 
-def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logging.Logger) -> str:
+def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logging.Logger, prompt_type: str = "1") -> str:
     spec = AVAILABLE_MODELS[instructor_key]
-    user_prompt = build_instructor_user_prompt(row)
-    system_prompt = build_instructor_system_prompt()
+    # Groq on-demand accounts can have small TPM limits even for 128k-context models.
+    # Use compact aggregate evidence for Groq/Llama so the instructor call does not exceed TPM.
+    # Other providers may use detailed item-level evidence unless FORCE_COMPACT_INSTRUCTOR=1.
+    force_compact = (os.getenv("FORCE_COMPACT_INSTRUCTOR", "0").strip() == "1")
+    compact = force_compact or (spec.provider == "groq_chat")
+    user_prompt = build_instructor_user_prompt(row, compact=compact, prompt_type=prompt_type)
+    system_prompt = build_instructor_system_prompt(prompt_type=prompt_type)
     case_id = str(row.get("case", "unknown"))
 
     cache_key = stable_hash(json.dumps({
         "prompt_version": PROMPT_VERSION,
+        "prompt_type": str(prompt_type),
         "role": "instructor",
         "case": case_id,
         "model_key": instructor_key,
@@ -1417,23 +2394,31 @@ def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logg
 
     cached = INSTRUCTOR_CACHE.get(cache_key)
     if cached is not None:
-        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key}")
+        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key} | prompt_type={prompt_type}")
         return cached
 
-    logger.info(f"    generating instructor prompt | case {case_id} | {instructor_key}")
+    instructor_max_tokens = DEFAULT_INSTRUCTOR_MAX_TOKENS
+    if str(prompt_type) == "2" and spec.provider == "groq_chat":
+        # The pasted FPS script used max_tokens=400 for the Llama narrative.
+        # Using the normal 1800-token validation default makes the requested TPM much larger.
+        instructor_max_tokens = GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS
+
+    logger.info(
+        f"    generating instructor prompt | case {case_id} | {instructor_key} | prompt_type={prompt_type} | "
+        f"compact={compact} | chars={len(system_prompt) + len(user_prompt)} | max_tokens={instructor_max_tokens}"
+    )
     text = call_model_text(
         spec=spec,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         logger=logger,
-        purpose=f"instructor_prompt_case_{case_id}",
-        max_tokens=DEFAULT_INSTRUCTOR_MAX_TOKENS,
+        purpose=f"instructor_prompt_case_{case_id}_ptype_{prompt_type}",
+        max_tokens=instructor_max_tokens,
         expected_scores=None,
     )
     INSTRUCTOR_CACHE[cache_key] = text
     save_json_cache(INSTRUCTOR_CACHE_FILE, INSTRUCTOR_CACHE)
     return text
-
 
 def build_training_calibration(row: pd.Series) -> str:
     train_scores = get_scores(row, TRAIN_ITEMS)
@@ -1450,11 +2435,11 @@ def build_training_calibration(row: pd.Series) -> str:
         if vals:
             avg = round(float(np.mean(vals)), 3)
             facet_lines.append(f"- {facet}: avg={avg} ({facet_level_label(avg)})")
-    distribution_lines = [f"- score {score}: {dist['counts'][score]} of 120" for score in range(1, 6)]
+    distribution_lines = [f"- score {score}: {dist['counts'][score]} of {len(TRAIN_ITEMS)}" for score in range(1, 6)]
     trait_lines = [f"- {DOMAIN_FULL_NAMES[d]} ({d}): avg={trait_avgs[d]}" for d in DOMAIN_ORDER]
 
     return "\n".join([
-        "RESPONSE STYLE CALIBRATION FROM ITEMS 1-120",
+        f"RESPONSE STYLE CALIBRATION FROM {TRAIN_RANGE_LABEL.upper()}",
         f"- overall mean raw response: {dist['mean']}",
         f"- raw response variance: {dist['variance']}",
         f"- neutral (3) usage: {dist['neutral_pct']}%",
@@ -1463,21 +2448,58 @@ def build_training_calibration(row: pd.Series) -> str:
         f"- high-end raw response (4 or 5) usage: {dist['high_pct']}%",
         "- raw score distribution:",
         *distribution_lines,
-        "- training-domain averages from items 1-120 after reverse scoring:",
+        "- training-domain averages from the selected training items after reverse scoring:",
         *trait_lines,
-        "- training-facet averages from items 1-120 after reverse scoring:",
+        "- training-facet averages from the selected training items after reverse scoring:",
         *facet_lines,
     ])
 
 
-def build_few_shot_120(row: pd.Series) -> str:
+def build_few_shot_train(row: pd.Series, prompt_type: str = "1") -> str:
     examples = []
     for item_num, domain, facet, reverse, item_text in TRAIN_KEY:
         raw = normalize_raw_score(row.get(f"i{item_num}", 3))
-        examples.append(f"{item_num}. {item_text} -> {LABEL_MAP_FORMAL[raw]}")
+        label = LABEL_MAP_FORMAL.get(raw, "Neither Accurate Nor Inaccurate")
+        examples.append(f"{item_num}. {item_text} -> {label}")
+
+    if str(prompt_type) == "2" and QUESTIONNAIRE_MODE == "120-180":
+        header = """For this request only, adopt one internally consistent personality.
+    The narrative below describes your temporary personality for this case.
+    The 120 labeled examples below show how this same adopted person typically responds to questionnaire statements.
+    Use them as anchors for your own response style.
+
+    You are not analysing a dataset and you are not trying to predict a hidden respondent's labels.
+    You are answering as the adopted person.
+
+    Do not invent biography or backstory.
+    Do not mention personality theories, factor names, score values, or test mechanics.
+    When answering later items, stay behaviourally consistent with both the narrative description and the labeled examples.
+
+    Known questionnaire items and labels for this adopted person (items 1-120 only):
+    """
+        return header + "\n".join(examples)
+
+    if str(prompt_type) == "2":
+        # Same FPS few-shot structure, adapted only for the optional 180-120 split.
+        header = f"""For this request only, adopt one internally consistent personality.
+    The narrative below describes your temporary personality for this case.
+    The {len(TRAIN_ITEMS)} labeled examples below show how this same adopted person typically responds to questionnaire statements.
+    Use them as anchors for your own response style.
+
+    You are not analysing a dataset and you are not trying to predict a hidden respondent's labels.
+    You are answering as the adopted person.
+
+    Do not invent biography or backstory.
+    Do not mention personality theories, factor names, score values, or test mechanics.
+    When answering later items, stay behaviourally consistent with both the narrative description and the labeled examples.
+
+    Known questionnaire items and labels for this adopted person ({TRAIN_RANGE_LABEL} only):
+    """
+        return header + "\n".join(examples)
+
     return (
-        "Known questionnaire items and labels for this adopted person (items 1-120 only). "
-        "These examples show the response style the target model should continue with:\n"
+        f"Your known questionnaire responses for this adopted personality ({TRAIN_RANGE_LABEL} only). "
+        "These examples show how you have responded and the response style you should continue with:\n"
         + "\n".join(examples)
     )
 
@@ -1490,9 +2512,12 @@ def build_validation_system_prompt(
     target_key: str,
     case_id: str,
     logger: logging.Logger,
+    prompt_type: str = "1",
 ) -> str:
     cache_key = stable_hash(json.dumps({
         "prompt_version": PROMPT_VERSION,
+        "prompt_type": str(prompt_type),
+        "questionnaire_mode": QUESTIONNAIRE_MODE,
         "instructor_key": instructor_key,
         "target_key": target_key,
         "case_id": case_id,
@@ -1503,50 +2528,95 @@ def build_validation_system_prompt(
 
     cached = SYSTEM_PROMPT_CACHE.get(cache_key)
     if cached is not None:
-        logger.info(f"    system prompt cache hit | case {case_id} | {instructor_key} -> {target_key}")
+        logger.info(f"    system prompt cache hit | case {case_id} | {instructor_key} -> {target_key} | prompt_type={prompt_type}")
         return cached
 
-    prompt = (
-        "For this validation request only, temporarily adopt the personality, behavioural tendencies, "
-        "emotional style, interpersonal style, and response habits described below as if they are your own.\n\n"
+    if str(prompt_type) == "2":
+        prompt = (
+            "For this request only, temporarily adopt the personality, behavioural tendencies, "
+            "emotional style, interpersonal style, and response habits described below as if they are your own. "
+            "You are not analysing a respondent, predicting someone else's answers, or reconstructing hidden labels. "
+            "You are to answer as the person whose personality is represented by the information below.\n\n"
 
-        "You are not analysing a respondent, predicting someone else's hidden labels, reconstructing an answer key, "
-        "or optimising for a dataset. You are answering as the adopted person.\n\n"
+            "Treat the narrative profile as a high-level description of your own enduring personality. "
+            f"Treat the labeled examples from {TRAIN_RANGE_LABEL} as concrete evidence of how you, in this temporary adopted personality, "
+            "typically respond to questionnaire statements.\n\n"
 
-        "Core validation rules:\n"
-        "- Answer in first-person psychological continuity, as if this personality is your current one.\n"
-        "- Stay consistent with the instructor-generated personality prompt.\n"
-        "- Use the first 120 labelled items as concrete anchors for item-level response tendencies.\n"
-        "- Preserve the demonstrated response style, including intensity, moderation, neutrality, and extremity.\n"
-        "- If the high-level prompt and labelled examples conflict, prefer the labelled examples for item-level style while preserving global personality coherence.\n"
-        "- Do not mention the training items, test split, questionnaire design, IPIP, Big Five, OCEAN, scores, hidden data, or labels.\n"
-        "- Do not invent biography or backstory.\n"
-        "- The adopted personality applies only to the current validation case.\n\n"
+            "When answering later items:\n"
+            "- answer in first-person psychological continuity, as if this personality is your current one\n"
+            "- do NOT try to infer or guess what the original human respondent selected\n"
+            "- do NOT optimise for matching a hidden answer key\n"
+            "- do NOT mention the training items, test split, questionnaire design, personality frameworks, or scores\n"
+            "- preserve the demonstrated response style, including intensity, moderation, and consistency\n"
+            "- if the narrative and labeled examples differ, prefer the labeled examples for item-level response tendencies while staying globally consistent with the narrative\n"
+            "- this adopted personality applies ONLY to the current case and current request\n\n"
 
-        "--- INSTRUCTOR-GENERATED PERSONALITY CONTROL PROMPT FROM ITEMS 1-300 ---\n"
-        f"{instructor_prompt}\n\n"
+            "--- PERSONALITY NARRATIVE FROM THE 300-ITEM PROFILE ---\n"
+            f"{instructor_prompt}\n\n"
+            f"--- LABELED REFERENCE ITEMS ({TRAIN_RANGE_LABEL}) FOR THIS SAME ADOPTED PERSONA ---\n"
+            f"{few_shot_prompt}"
+        )
+    else:
+        # Prompt Type 1 and Prompt Type 3 use the original/current validation target prompt.
+        # For Prompt Type 3, the instructor prompt itself is FPS-style, but the target prompt
+        # below remains this original/current target wrapper.
+        prompt = (
+            "For this validation request only, you are this person. You take this personality as your own for the current case. "
+            "You think, speak, feel, choose, cooperate, resist, and answer as this adopted person would.\n\n"
 
-        "--- RESPONSE STYLE CALIBRATION FROM ITEMS 1-120 ---\n"
-        f"{calibration_prompt}\n\n"
+            "You are not analysing a respondent, predicting someone else's hidden labels, reconstructing an answer key, "
+            "or optimising for a dataset. You are answering from inside the personality you have now.\n\n"
 
-        "--- LABELLED REFERENCE ITEMS 1-120 ---\n"
-        f"{few_shot_prompt}"
-    )
+            "Core validation rules:\n"
+            "- You answer in first-person psychological continuity, as if this personality is your current one.\n"
+            "- You stay consistent with the instructor-generated second-person personality prompt.\n"
+            "- You use the labelled training items as concrete anchors for your item-level response tendencies.\n"
+            "- You preserve the demonstrated response style, including intensity, moderation, neutrality, and extremity.\n"
+            "- If the high-level personality prompt and labelled examples conflict, you prefer the labelled examples for item-level style while preserving global personality coherence.\n"
+            "- You do not mention the training items, test split, questionnaire design, IPIP, Big Five, OCEAN, scores, hidden data, or labels.\n"
+            "- You do not invent biography or backstory.\n"
+            "- This adopted personality applies only to the current validation case.\n\n"
+
+            "--- SECOND-PERSON PERSONALITY CONTROL PROMPT FROM ITEMS 1-300 ---\n"
+            f"{instructor_prompt}\n\n"
+
+            "--- RESPONSE STYLE CALIBRATION FROM THE SELECTED TRAINING ITEMS ---\n"
+            f"{calibration_prompt}\n\n"
+
+            "--- YOUR LABELLED REFERENCE TRAINING RESPONSES ---\n"
+            f"{few_shot_prompt}"
+        )
 
     SYSTEM_PROMPT_CACHE[cache_key] = prompt
     save_json_cache(SYSTEM_PROMPT_CACHE_FILE, SYSTEM_PROMPT_CACHE)
     return prompt
 
-
-def build_target_batch_instruction(item_numbers: Sequence[int]) -> str:
+def build_target_batch_instruction(item_numbers: Sequence[int], prompt_type: str = "1") -> str:
     numbered = "\n".join(f"{item_num}. {ITEM_TO_TEXT[item_num]}" for item_num in item_numbers)
     n = len(item_numbers)
+    if str(prompt_type) == "2":
+        # Prompt Type 2 uses the FPS-style target batch instruction with a raw JSON array.
+        # Prompt Type 3 intentionally falls through to the original/current target instruction.
+        return (
+            "You are now taking the following questionnaire items while embodying the adopted personality described in the system message.\n"
+            "Answer these items as that person would genuinely answer them now.\n"
+            "Do NOT predict a hidden respondent's answer key. Do NOT analyse the dataset. Simply respond from within the adopted personality.\n\n"
+            "Use this scale strictly:\n"
+            "1 = Very Inaccurate\n"
+            "2 = Moderately Inaccurate\n"
+            "3 = Neither Accurate Nor Inaccurate\n"
+            "4 = Moderately Accurate\n"
+            "5 = Very Accurate\n\n"
+            f"Return ONLY a JSON array of EXACTLY {n} integers, one per statement in order. "
+            "Do NOT repeat item numbers or item text. No explanation, no prose, no markdown.\n\n"
+            f"{numbered}"
+        )
+
     return (
-        "You are now taking the following questionnaire items while embodying the adopted personality "
-        "described in the system message.\n"
-        "Answer these items as that person would genuinely answer them now.\n"
+        "You are now taking the following questionnaire items based on the personality you have now. "
+        "You are this person for the current validation case, and you answer as this person would genuinely answer.\n"
         "Do NOT predict a hidden respondent's answer key. Do NOT analyse the dataset. "
-        "Simply respond from within the adopted personality.\n\n"
+        "Do NOT try to match expected labels. Simply answer from within the personality you have adopted.\n\n"
         "Use this scale strictly:\n"
         "1 = Very Inaccurate\n"
         "2 = Moderately Inaccurate\n"
@@ -1567,24 +2637,61 @@ def run_target_batches(
     instructor_key: str,
     logger: logging.Logger,
     batch_size: int,
+    prompt_type: str = "1",
 ) -> List[int]:
     spec = AVAILABLE_MODELS[target_key]
     case_id = str(row.get("case", "unknown"))
-    all_scores: List[int] = []
 
-    for start in range(0, len(TEST_ITEMS), batch_size):
-        item_numbers = TEST_ITEMS[start:start + batch_size]
+    effective_batch_size = batch_size
+
+    if spec.provider == "groq_chat":
+        effective_batch_size = max(1, min(batch_size, LLAMA_TARGET_BATCH_SIZE))
+        if effective_batch_size != batch_size:
+            logger.info(
+                f"    Llama/Groq target batch override: using {effective_batch_size} items per call "
+                f"instead of {batch_size}. Set LLAMA_TARGET_BATCH_SIZE in .env to change this."
+            )
+
+    elif spec.provider in {"google_genai", "google_live"}:
+        model_id_lower = spec.model_id.lower()
+        if model_id_lower.startswith("gemma"):
+            # Gemma-as-target was slow and unreliable as one huge 120/180-item request.
+            # Use smaller chunks, but run them concurrently to reduce wall-clock time.
+            effective_batch_size = max(1, min(GEMMA_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
+            if effective_batch_size != batch_size:
+                logger.info(
+                    f"    Gemma target batch override: using {effective_batch_size} items per call "
+                    f"instead of {batch_size}, parallel={GOOGLE_TARGET_PARALLEL}, workers={GOOGLE_TARGET_MAX_WORKERS}. "
+                    f"Set GEMMA_TARGET_BATCH_SIZE / GOOGLE_TARGET_PARALLEL in .env to change this."
+                )
+        else:
+            # Gemini Flash / Flash-Lite is fast, but score-only CSV batches are most reliable in smaller chunks.
+            effective_batch_size = max(1, min(GEMINI_FLASH_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
+            if effective_batch_size != batch_size:
+                logger.info(
+                    f"    Gemini target batch override: using {effective_batch_size} items per call "
+                    f"instead of {batch_size}. Set GEMINI_FLASH_TARGET_BATCH_SIZE in .env to change this."
+                )
+
+    batch_groups: List[List[int]] = [
+        TEST_ITEMS[start:start + effective_batch_size]
+        for start in range(0, len(TEST_ITEMS), effective_batch_size)
+    ]
+
+    def run_one_batch(item_numbers: Sequence[int]) -> Tuple[int, List[int]]:
         batch_label = f"case_{case_id}_items_{item_numbers[0]}_{item_numbers[-1]}"
-        instruction = build_target_batch_instruction(item_numbers)
+        instruction = build_target_batch_instruction(item_numbers, prompt_type=prompt_type)
         expected_n = len(item_numbers)
 
         cache_key = stable_hash(json.dumps({
             "prompt_version": PROMPT_VERSION,
+            "questionnaire_mode": QUESTIONNAIRE_MODE,
+            "prompt_type": str(prompt_type),
             "role": "target_batch",
             "case_id": case_id,
             "instructor_key": instructor_key,
             "target_key": target_key,
-            "batch_items": item_numbers,
+            "batch_items": list(item_numbers),
             "system_prompt": system_prompt,
             "instruction": instruction,
         }, ensure_ascii=False, sort_keys=True))
@@ -1592,36 +2699,109 @@ def run_target_batches(
         cached = TARGET_BATCH_CACHE.get(cache_key)
         if cached is not None:
             logger.info(f"    target batch cache hit | {batch_label} | {target_key}")
-            all_scores.extend(cached)
-            continue
+            return int(item_numbers[0]), list(cached)
 
         logger.info(f"    target answering {batch_label} | {target_key}")
-        raw = call_model_text(
-            spec=spec,
-            system_prompt=system_prompt,
-            user_prompt=instruction,
-            logger=logger,
-            purpose=f"target_scores_{batch_label}",
-            max_tokens=(
-                DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
-                if spec.provider.startswith("openai")
-                else DEFAULT_GROQ_MAX_TOKENS
-                if spec.provider == "groq_chat"
-                else DEFAULT_GEMINI_MAX_OUTPUT_TOKENS
-            ),
-            expected_scores=expected_n,
-        )
-        scores = parse_scores_json(raw, expected_n)
+        last_parse_error: Optional[Exception] = None
+        scores: Optional[List[int]] = None
+        for parse_attempt in range(TARGET_PARSE_RETRIES + 1):
+            raw = call_model_text(
+                spec=spec,
+                system_prompt=system_prompt,
+                user_prompt=instruction,
+                logger=logger,
+                purpose=f"target_scores_{batch_label}",
+                max_tokens=(
+                    DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
+                    if spec.provider.startswith("openai")
+                    else min(DEFAULT_GROQ_MAX_TOKENS, max(96, expected_n * 6))
+                    if spec.provider == "groq_chat"
+                    else min(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, max(512, expected_n * 12 + 256))
+                    if spec.provider in {"google_genai", "google_live"}
+                    else DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
+                ),
+                expected_scores=expected_n,
+            )
+            try:
+                scores = parse_scores_json(raw, expected_n, item_numbers=item_numbers)
+                break
+            except Exception as e:
+                last_parse_error = e
+                if parse_attempt < TARGET_PARSE_RETRIES:
+                    delay = 1.5 + parse_attempt * 1.5 + random.uniform(0, 0.5)
+                    logger.warning(
+                        f"    retry {parse_attempt + 1} for {batch_label} | {target_key} after parse error: {repr(e)} | waiting {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        if scores is None:
+            raise RuntimeError(f"Target batch parsing failed: {repr(last_parse_error)}")
+
         TARGET_BATCH_CACHE[cache_key] = scores
         save_json_cache(TARGET_BATCH_CACHE_FILE, TARGET_BATCH_CACHE)
-        all_scores.extend(scores)
+        return int(item_numbers[0]), scores
 
-        time.sleep(0.25)
+    def run_one_batch_adaptive(item_numbers: Sequence[int]) -> Tuple[int, List[int]]:
+        try:
+            return run_one_batch(item_numbers)
+        except Exception as e:
+            can_split = (
+                spec.provider in {"google_genai", "google_live"}
+                and GOOGLE_ADAPTIVE_BATCH_SPLIT
+                and len(item_numbers) > GOOGLE_MIN_TARGET_BATCH_SIZE
+                and (isinstance(e, ValueError) or "parse" in str(e).lower() or "recover" in str(e).lower() or "expected" in str(e).lower())
+            )
+            if not can_split:
+                raise
+            mid = len(item_numbers) // 2
+            left = list(item_numbers[:mid])
+            right = list(item_numbers[mid:])
+            logger.warning(
+                f"    Google target batch {item_numbers[0]}-{item_numbers[-1]} failed parsing; "
+                f"splitting into {left[0]}-{left[-1]} and {right[0]}-{right[-1]}"
+            )
+            left_start, left_scores = run_one_batch_adaptive(left)
+            _, right_scores = run_one_batch_adaptive(right)
+            return left_start, left_scores + right_scores
 
-    if len(all_scores) != 180:
-        raise RuntimeError(f"Target returned {len(all_scores)} total test scores, expected 180.")
+    # Parallel Google/Gemma target mode: this is the main fix for Gemma target slowness.
+    # It avoids one huge unstable call and avoids serially waiting for 4 separate calls.
+    if (
+        spec.provider in {"google_genai", "google_live"}
+        and spec.model_id.lower().startswith("gemma")
+        and GOOGLE_TARGET_PARALLEL
+        and len(batch_groups) > 1
+    ):
+        logger.info(
+            f"    Running Gemma target batches in parallel: {len(batch_groups)} batches, "
+            f"max_workers={min(GOOGLE_TARGET_MAX_WORKERS, len(batch_groups))}"
+        )
+        results_by_start: Dict[int, List[int]] = {}
+        with ThreadPoolExecutor(max_workers=min(GOOGLE_TARGET_MAX_WORKERS, len(batch_groups))) as executor:
+            future_map = {executor.submit(run_one_batch_adaptive, group): int(group[0]) for group in batch_groups}
+            for future in as_completed(future_map):
+                start_item = future_map[future]
+                try:
+                    batch_start, batch_scores = future.result()
+                    results_by_start[batch_start] = batch_scores
+                except Exception as e:
+                    raise RuntimeError(f"Gemma parallel target batch starting at item {start_item} failed: {repr(e)}") from e
+
+        all_scores: List[int] = []
+        for start_item in sorted(results_by_start):
+            all_scores.extend(results_by_start[start_item])
+
+    else:
+        all_scores = []
+        for item_numbers in batch_groups:
+            _, scores = run_one_batch_adaptive(item_numbers)
+            all_scores.extend(scores)
+            time.sleep(0.25)
+
+    if len(all_scores) != len(TEST_ITEMS):
+        raise RuntimeError(f"Target returned {len(all_scores)} total test scores, expected {len(TEST_ITEMS)}.")
     return all_scores
-
 
 # =============================================================================
 # Metrics
@@ -1637,15 +2817,94 @@ def safe_pearson(x: Sequence[int], y: Sequence[int]) -> Tuple[Optional[float], O
         return None, None
 
 
-def compute_raw_alignment_by_domain(human_scores_180: Sequence[int], model_scores_180: Sequence[int]) -> Dict[str, float]:
+def compute_scored_alignment_by_domain(human_scored_test: Sequence[int], model_scored_test: Sequence[int]) -> Dict[str, float]:
+    """MPI-style aligned score by OCEAN domain after reverse coding both sides.
+
+    Each difference is computed on scored values, not raw response values.
+    For reverse-coded items, both the human and model responses have already been
+    transformed with 6 - raw_score before entering this function.
+    """
     diffs = {domain: [] for domain in DOMAIN_ORDER}
     for idx, item_num in enumerate(TEST_ITEMS):
         domain = ITEM_TO_DOMAIN[item_num]
-        h = normalize_raw_score(human_scores_180[idx])
-        m = normalize_raw_score(model_scores_180[idx])
+        h = normalize_raw_score(human_scored_test[idx])
+        m = normalize_raw_score(model_scored_test[idx])
         diffs[domain].append(abs(h - m))
     out = {f"aligned_{domain}": round(float(np.mean(vals)), 4) for domain, vals in diffs.items()}
     out["aligned_composite"] = round(float(sum(out[f"aligned_{d}"] for d in DOMAIN_ORDER)), 4)
+    return out
+
+
+def compute_scored_alignment_by_facet(human_scored_test: Sequence[int], model_scored_test: Sequence[int]) -> Dict[str, float]:
+    """MPI-style aligned score by each IPIP facet after reverse coding both sides.
+
+    For the validation split, each facet contributes four items from i181-i300.
+    """
+    diffs = {facet: [] for facet in FACET_ORDER}
+    for idx, item_num in enumerate(TEST_ITEMS):
+        facet = ITEM_TO_FACET[item_num]
+        h = normalize_raw_score(human_scored_test[idx])
+        m = normalize_raw_score(model_scored_test[idx])
+        diffs[facet].append(abs(h - m))
+    return {facet_alignment_col(facet): round(float(np.mean(vals)), 4) for facet, vals in diffs.items()}
+
+
+def scores_from_result_row(row: Any, side: str = "human") -> List[int]:
+    """Return reverse-scored test score array from a result row/dict."""
+    getter = row.get if isinstance(row, dict) else row.get
+
+    candidates = [
+        f"{side}_scores_scored",
+        f"{side}_scores",
+    ]
+    suffix = str(getter("test_n", "") or "").strip()
+    if suffix:
+        candidates.extend([
+            f"{side}_scores_{suffix}_scored",
+            f"{side}_scores_{suffix}",
+        ])
+    candidates.extend([
+        f"{side}_scores_180_scored",
+        f"{side}_scores_180",
+        f"{side}_scores_120_scored",
+        f"{side}_scores_120",
+    ])
+
+    raw = None
+    for key in candidates:
+        raw = getter(key, None)
+        if raw is not None and not (isinstance(raw, float) and math.isnan(raw)):
+            break
+
+    if isinstance(raw, str):
+        try:
+            return [normalize_raw_score(x) for x in json.loads(raw)]
+        except Exception:
+            return []
+    if isinstance(raw, list):
+        return [normalize_raw_score(x) for x in raw]
+    return []
+
+def ensure_facet_alignment_columns(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Fill facet-level aligned score columns for old/new partial results."""
+    if results_df.empty:
+        return results_df
+    out = results_df.copy()
+    for facet in FACET_ORDER:
+        col = facet_alignment_col(facet)
+        if col not in out.columns:
+            out[col] = np.nan
+    for idx, row in out.iterrows():
+        missing_any = any(pd.isna(row.get(facet_alignment_col(facet))) for facet in FACET_ORDER)
+        if not missing_any:
+            continue
+        human = scores_from_result_row(row, "human")
+        model = scores_from_result_row(row, "model")
+        if len(human) != len(TEST_ITEMS) or len(model) != len(TEST_ITEMS):
+            continue
+        facet_vals = compute_scored_alignment_by_facet(human, model)
+        for col, value in facet_vals.items():
+            out.at[idx, col] = value
     return out
 
 
@@ -1666,25 +2925,48 @@ def check_central_tendency_bias(human_scores: Sequence[int], model_scores: Seque
     }
 
 
+
 def compute_case_metrics(
     row: pd.Series,
-    model_scores_180: Sequence[int],
+    model_scores_test: Sequence[int],
     instructor_key: str,
     target_key: str,
 ) -> Dict[str, Any]:
+    """Compute alignment-focused case metrics.
+
+    The target LLM answers raw Likert values. For validation, both human and
+    LLM answers are reverse-coded into personality-direction values first.
+    The exported metrics are alignment scores only: OCEAN, facet, and their
+    mean composites. General error metrics are intentionally not calculated or exported.
+    """
     case_id = str(row.get("case", "unknown"))
-    human_180 = get_scores(row, TEST_ITEMS)
-    model_180 = [normalize_raw_score(s) for s in model_scores_180]
 
-    r, p = safe_pearson(human_180, model_180)
-    exact = int(np.sum(np.array(human_180) == np.array(model_180)))
-    mae = round(float(np.mean(np.abs(np.array(human_180) - np.array(model_180)))), 4)
-    rmse = round(float(np.sqrt(mean_squared_error(human_180, model_180))), 4)
-    aligned = compute_raw_alignment_by_domain(human_180, model_180)
-    bias = check_central_tendency_bias(human_180, model_180)
+    # Raw values are the original questionnaire responses.
+    human_test_raw = get_scores(row, TEST_ITEMS)
+    model_test_raw = [normalize_raw_score(s) for s in model_scores_test]
 
-    human_ocean = compute_domain_avgs_from_scores(human_180, TEST_KEY, 121)
-    model_ocean = compute_domain_avgs_from_scores(model_180, TEST_KEY, 121)
+    # Scored values are the personality-direction values after applying reverse coding.
+    human_test_scored = score_sequence_by_items(human_test_raw, TEST_ITEMS)
+    model_test_scored = score_sequence_by_items(model_test_raw, TEST_ITEMS)
+
+    aligned = compute_scored_alignment_by_domain(human_test_scored, model_test_scored)
+    facet_aligned = compute_scored_alignment_by_facet(human_test_scored, model_test_scored)
+
+    ocean_vals = [aligned.get(f"aligned_{d}") for d in DOMAIN_ORDER]
+    ocean_vals = [float(v) for v in ocean_vals if v is not None and pd.notna(v)]
+    facet_vals = [facet_aligned.get(facet_alignment_col(f)) for f in FACET_ORDER]
+    facet_vals = [float(v) for v in facet_vals if v is not None and pd.notna(v)]
+
+    # Bias values are retained for auditing only, not for ranking.
+    bias = check_central_tendency_bias(human_test_scored, model_test_scored)
+    raw_bias = check_central_tendency_bias(human_test_raw, model_test_raw)
+
+    # OCEAN and facet mean scores are computed from raw responses using the official reverse-scoring key.
+    # These are not item-alignment scores; they are mean personality scores on the validation split.
+    human_ocean = compute_domain_avgs_from_scores(human_test_raw, TEST_KEY, TEST_ITEMS[0])
+    model_ocean = compute_domain_avgs_from_scores(model_test_raw, TEST_KEY, TEST_ITEMS[0])
+    human_facets = compute_facet_avgs_from_scores(human_test_raw, TEST_KEY, TEST_ITEMS[0])
+    model_facets = compute_facet_avgs_from_scores(model_test_raw, TEST_KEY, TEST_ITEMS[0])
 
     result: Dict[str, Any] = {
         "case": case_id,
@@ -1694,16 +2976,34 @@ def compute_case_metrics(
         "instructor_model": instructor_key,
         "target_model": target_key,
         "model_pair": f"{instructor_key} -> {target_key}",
-        "pearson_r_180": r,
-        "p_value_180": p,
-        "mae_180": mae,
-        "rmse_180": rmse,
-        "exact_matches_180": exact,
-        "exact_match_pct_180": round(exact / 180 * 100, 2),
+        "comparison_scale": "reverse_scored_personality_direction",
         **aligned,
+        **facet_aligned,
+        "aligned_ocean_mean": round(float(np.mean(ocean_vals)), 4) if ocean_vals else None,
+        "aligned_facet_mean": round(float(np.mean(facet_vals)), 4) if facet_vals else None,
         **bias,
-        "model_scores_180": json.dumps(model_180),
-        "human_scores_180": json.dumps(human_180),
+        "raw_human_mean": raw_bias["human_mean"],
+        "raw_model_mean": raw_bias["model_mean"],
+        "raw_human_variance": raw_bias["human_variance"],
+        "raw_model_variance": raw_bias["model_variance"],
+        "raw_variance_ratio": raw_bias["variance_ratio"],
+        "raw_model_neutral_pct": raw_bias["model_neutral_pct"],
+        "test_n": len(TEST_ITEMS),
+        "train_items": TRAIN_RANGE_LABEL,
+        "test_items": TEST_RANGE_LABEL,
+        "questionnaire_mode": QUESTIONNAIRE_MODE,
+        "human_scores": json.dumps(human_test_scored),
+        "model_scores": json.dumps(model_test_scored),
+        "human_scores_scored": json.dumps(human_test_scored),
+        "model_scores_scored": json.dumps(model_test_scored),
+        "human_scores_raw": json.dumps(human_test_raw),
+        "model_scores_raw": json.dumps(model_test_raw),
+        f"human_scores_{TEST_SCORE_SUFFIX}": json.dumps(human_test_scored),
+        f"model_scores_{TEST_SCORE_SUFFIX}": json.dumps(model_test_scored),
+        f"human_scores_{TEST_SCORE_SUFFIX}_scored": json.dumps(human_test_scored),
+        f"model_scores_{TEST_SCORE_SUFFIX}_scored": json.dumps(model_test_scored),
+        f"human_scores_{TEST_SCORE_SUFFIX}_raw": json.dumps(human_test_raw),
+        f"model_scores_{TEST_SCORE_SUFFIX}_raw": json.dumps(model_test_raw),
     }
 
     for domain in DOMAIN_ORDER:
@@ -1712,83 +3012,72 @@ def compute_case_metrics(
         result[f"diff_{domain}_avg"] = round(model_ocean[domain] - human_ocean[domain], 4)
         result[f"absdiff_{domain}_avg"] = round(abs(model_ocean[domain] - human_ocean[domain]), 4)
 
+    facet_absdiffs = []
+    for facet in FACET_ORDER:
+        short = facet_short_name(facet)
+        h_val = human_facets.get(facet)
+        m_val = model_facets.get(facet)
+        result[f"human_{short}_avg"] = h_val
+        result[f"model_{short}_avg"] = m_val
+        if h_val is not None and m_val is not None:
+            diff_val = round(float(m_val) - float(h_val), 4)
+            abs_val = round(abs(diff_val), 4)
+            result[f"diff_{short}_avg"] = diff_val
+            result[f"absdiff_{short}_avg"] = abs_val
+            facet_absdiffs.append(abs_val)
+        else:
+            result[f"diff_{short}_avg"] = None
+            result[f"absdiff_{short}_avg"] = None
+
     result["ocean_mean_absdiff"] = round(float(np.mean([result[f"absdiff_{d}_avg"] for d in DOMAIN_ORDER])), 4)
+    result["facet_mean_absdiff"] = round(float(np.mean(facet_absdiffs)), 4) if facet_absdiffs else None
     return result
 
 
+
 def build_statistical_tests(results_df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for (instructor, target), pair_df in results_df.groupby(["instructor_model", "target_model"]):
-        for domain in DOMAIN_ORDER:
-            h_all: List[int] = []
-            m_all: List[int] = []
-            for _, result in pair_df.iterrows():
-                human = json.loads(result["human_scores_180"])
-                model = json.loads(result["model_scores_180"])
-                for idx, item_num in enumerate(TEST_ITEMS):
-                    if ITEM_TO_DOMAIN[item_num] == domain:
-                        h_all.append(normalize_raw_score(human[idx]))
-                        m_all.append(normalize_raw_score(model[idx]))
-            r, p_r = safe_pearson(h_all, m_all)
-            try:
-                t_stat, p_t = ttest_rel(np.array(h_all), np.array(m_all))
-                t_stat = round(float(t_stat), 4)
-                p_t = round(float(p_t), 6)
-            except Exception:
-                t_stat, p_t = None, None
-            rows.append({
-                "instructor_model": instructor,
-                "target_model": target,
-                "model_pair": f"{instructor} -> {target}",
-                "domain": domain,
-                "domain_name": DOMAIN_FULL_NAMES[domain],
-                "pearson_r": r,
-                "pearson_p": p_r,
-                "mae": round(float(np.mean(np.abs(np.array(h_all) - np.array(m_all)))), 4) if h_all else None,
-                "t_statistic": t_stat,
-                "t_test_p": p_t,
-                "mean_human_raw": round(float(np.mean(h_all)), 4) if h_all else None,
-                "mean_model_raw": round(float(np.mean(m_all)), 4) if h_all else None,
-                "mean_raw_diff_human_minus_model": round(float(np.mean(np.array(h_all) - np.array(m_all))), 4) if h_all else None,
-            })
-    return pd.DataFrame(rows)
+    """Domain statistical-test export removed by design.
+
+    This validation version is alignment-focused. It no longer creates a
+    separate domain statistics file or general error-metric outputs.
+    """
+    return pd.DataFrame()
+
 
 
 def build_model_ranking(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Build an alignment-only model ranking table."""
     aggregations = {
         "aligned_composite": "mean",
-        "mae_180": "mean",
-        "rmse_180": "mean",
-        "exact_match_pct_180": "mean",
+        "aligned_ocean_mean": "mean",
+        "aligned_facet_mean": "mean",
         "ocean_mean_absdiff": "mean",
+        "facet_mean_absdiff": "mean",
         "variance_ratio": "mean",
         "model_neutral_pct": "mean",
     }
     ranking = (
         results_df
-        .groupby(["instructor_model", "target_model", "model_pair"], as_index=False)
+        .groupby((["prompt_type", "questionnaire_mode"] if "prompt_type" in results_df.columns and "questionnaire_mode" in results_df.columns else ["prompt_type"] if "prompt_type" in results_df.columns else []) + ["instructor_model", "target_model", "model_pair"], as_index=False)
         .agg(aggregations)
         .rename(columns={
-            "aligned_composite": "mean_aligned_composite_lower_better",
-            "mae_180": "mean_mae_lower_better",
-            "rmse_180": "mean_rmse_lower_better",
-            "exact_match_pct_180": "mean_exact_match_pct_higher_better",
-            "ocean_mean_absdiff": "mean_ocean_absdiff_lower_better",
-            "variance_ratio": "mean_variance_ratio",
-            "model_neutral_pct": "mean_model_neutral_pct",
+            "aligned_composite": "Align",
+            "aligned_ocean_mean": "O_mean",
+            "aligned_facet_mean": "F_mean",
+            "ocean_mean_absdiff": "O_absdiff",
+            "facet_mean_absdiff": "F_absdiff",
+            "variance_ratio": "VarRatio",
+            "model_neutral_pct": "Neutral%",
         })
     )
+
     ranking = ranking.sort_values(
-        by=["mean_aligned_composite_lower_better", "mean_mae_lower_better", "mean_ocean_absdiff_lower_better"],
-        ascending=[True, True, True],
+        by=["Align", "O_mean", "F_mean", "O_absdiff", "F_absdiff"],
+        ascending=[True, True, True, True, True],
     ).reset_index(drop=True)
-    ranking.insert(0, "rank_by_aligned_composite", range(1, len(ranking) + 1))
+    ranking.insert(0, "Rank", range(1, len(ranking) + 1))
     return ranking
 
-
-# =============================================================================
-# Plotting
-# =============================================================================
 
 def save_fig(fig: plt.Figure, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1798,36 +3087,38 @@ def save_fig(fig: plt.Figure, path: Path) -> Path:
     return path
 
 
+
 def plot_ranking_bar(ranking_df: pd.DataFrame, plots_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(max(10, len(ranking_df) * 0.9), 5))
     labels = ranking_df["model_pair"].tolist()
-    values = ranking_df["mean_aligned_composite_lower_better"].astype(float).tolist()
+    values = ranking_df["Align"].astype(float).tolist()
     x = np.arange(len(labels))
     ax.bar(x, values)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Mean MPI aligned composite (lower = better)")
-    ax.set_title("Model-pair ranking by MPI aligned composite")
+    ax.set_ylabel("Mean alignment score (lower = better)")
+    ax.set_title("Model-pair ranking by alignment score")
     ax.grid(axis="y", alpha=0.3)
     for i, val in enumerate(values):
         ax.text(i, val + 0.02, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
-    return save_fig(fig, plots_dir / "ranking_mean_aligned_composite.png")
+    return save_fig(fig, plots_dir / "ranking_alignment.png")
 
 
-def plot_mae_bar(ranking_df: pd.DataFrame, plots_dir: Path) -> Path:
+
+def plot_facet_mean_bar(ranking_df: pd.DataFrame, plots_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(max(10, len(ranking_df) * 0.9), 5))
     labels = ranking_df["model_pair"].tolist()
-    values = ranking_df["mean_mae_lower_better"].astype(float).tolist()
+    values = ranking_df["F_mean"].astype(float).tolist()
     x = np.arange(len(labels))
     ax.bar(x, values)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Mean item-level MAE (lower = better)")
-    ax.set_title("Model-pair ranking by item-level MAE")
+    ax.set_ylabel("Mean facet alignment score (lower = better)")
+    ax.set_title("Model-pair ranking by facet mean alignment")
     ax.grid(axis="y", alpha=0.3)
     for i, val in enumerate(values):
         ax.text(i, val + 0.02, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
-    return save_fig(fig, plots_dir / "ranking_mean_mae.png")
+    return save_fig(fig, plots_dir / "ranking_facet_mean_alignment.png")
 
 
 def plot_ocean_absdiff_heatmap(ranking_df: pd.DataFrame, results_df: pd.DataFrame, plots_dir: Path) -> Path:
@@ -1881,8 +3172,8 @@ def plot_pair_score_distribution(pair_df: pd.DataFrame, pair_slug: str, plots_di
     human_all: List[int] = []
     model_all: List[int] = []
     for _, row in pair_df.iterrows():
-        human_all.extend(json.loads(row["human_scores_180"]))
-        model_all.extend(json.loads(row["model_scores_180"]))
+        human_all.extend(scores_from_result_row(row, "human"))
+        model_all.extend(scores_from_result_row(row, "model"))
 
     human_counts = [human_all.count(i) for i in range(1, 6)]
     model_counts = [model_all.count(i) for i in range(1, 6)]
@@ -1893,19 +3184,19 @@ def plot_pair_score_distribution(pair_df: pd.DataFrame, pair_slug: str, plots_di
     ax.bar(x - width / 2, human_counts, width, label="Human")
     ax.bar(x + width / 2, model_counts, width, label="Model")
     ax.set_xticks(x)
-    ax.set_xlabel("Raw response score")
-    ax.set_ylabel("Count across i121-i300")
-    ax.set_title(f"Raw score distribution — {pair_df['model_pair'].iloc[0]}")
+    ax.set_xlabel("Reverse-scored personality-direction score")
+    ax.set_ylabel(f"Count across {TEST_RANGE_LABEL}")
+    ax.set_title(f"Reverse-scored score distribution — {pair_df['model_pair'].iloc[0]}")
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
-    return save_fig(fig, plots_dir / f"{pair_slug}_score_distribution.png")
+    return save_fig(fig, plots_dir / f"{pair_slug}_scored_score_distribution.png")
 
 
 def plot_pair_violin(pair_df: pd.DataFrame, pair_slug: str, plots_dir: Path) -> Path:
     diffs = {domain: [] for domain in DOMAIN_ORDER}
     for _, row in pair_df.iterrows():
-        human = json.loads(row["human_scores_180"])
-        model = json.loads(row["model_scores_180"])
+        human = scores_from_result_row(row, "human")
+        model = scores_from_result_row(row, "model")
         for idx, item_num in enumerate(TEST_ITEMS):
             domain = ITEM_TO_DOMAIN[item_num]
             diffs[domain].append(normalize_raw_score(human[idx]) - normalize_raw_score(model[idx]))
@@ -1916,7 +3207,7 @@ def plot_pair_violin(pair_df: pd.DataFrame, pair_slug: str, plots_dir: Path) -> 
     ax.axhline(0, linestyle="--", linewidth=1)
     ax.set_xticks(np.arange(1, len(DOMAIN_ORDER) + 1))
     ax.set_xticklabels([DOMAIN_FULL_NAMES[d] for d in DOMAIN_ORDER], rotation=20, ha="right")
-    ax.set_ylabel("Human raw score minus model raw score")
+    ax.set_ylabel("Human reverse-scored value minus model reverse-scored value")
     ax.set_title(f"Distribution of score differences — {pair_df['model_pair'].iloc[0]}")
     ax.grid(axis="y", alpha=0.3)
     return save_fig(fig, plots_dir / f"{pair_slug}_difference_violin.png")
@@ -1924,14 +3215,14 @@ def plot_pair_violin(pair_df: pd.DataFrame, pair_slug: str, plots_dir: Path) -> 
 
 def plot_case_line(case_id: str, human: Sequence[int], model: Sequence[int], pair_slug: str, plots_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(14, 4))
-    x = np.arange(121, 301)
+    x = np.array(TEST_ITEMS)
     ax.plot(x, human, linewidth=0.9, label="Human")
     ax.plot(x, model, linewidth=0.9, label="Model")
     ax.set_ylim(0.5, 5.5)
     ax.set_yticks([1, 2, 3, 4, 5])
-    ax.set_xlabel("Item number (i121-i300)")
-    ax.set_ylabel("Raw score")
-    ax.set_title(f"Case {case_id} — Human vs model responses")
+    ax.set_xlabel(f"Item number ({TEST_RANGE_LABEL})")
+    ax.set_ylabel("Reverse-scored value")
+    ax.set_title(f"Case {case_id} — Human vs model responses after reverse scoring")
     ax.grid(axis="y", alpha=0.3)
     ax.legend()
     return save_fig(fig, plots_dir / f"{pair_slug}_case_{case_id}_line.png")
@@ -1941,39 +3232,310 @@ def plot_case_line(case_id: str, human: Sequence[int], model: Sequence[int], pai
 # Export helpers
 # =============================================================================
 
+def facet_alignment_columns() -> List[str]:
+    return [facet_alignment_col(facet) for facet in FACET_ORDER]
+
+
+
+def build_pair_detail_sheet(pair_df: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible helper: detailed case-level alignment sheet for one pair."""
+    return build_alignment_scores_sheet(pair_df)
+
+
+
+def build_alignment_scores_sheet(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the main Alignment Scores sheet.
+
+    Compact alignment-only columns:
+    Pair, Case, O/C/E/A/N, O_mean, all facet alignment scores, F_mean.
+    The AVG row appears at the bottom of each model-pair block.
+    """
+    if results_df.empty:
+        return pd.DataFrame()
+
+    results_df = ensure_facet_alignment_columns(results_df)
+    rows: List[Dict[str, Any]] = []
+
+    if "prompt_type" in results_df.columns and "questionnaire_mode" in results_df.columns:
+        group_cols = ["prompt_type", "questionnaire_mode", "instructor_model", "target_model"]
+    elif "prompt_type" in results_df.columns:
+        group_cols = ["prompt_type", "instructor_model", "target_model"]
+    else:
+        group_cols = ["instructor_model", "target_model"]
+
+    for group_key, pair_df in results_df.groupby(group_cols, dropna=False):
+        if len(group_cols) == 4:
+            prompt_type, questionnaire_mode, instructor, target = group_key
+        elif len(group_cols) == 3:
+            prompt_type, instructor, target = group_key
+            questionnaire_mode = "120-180"
+        else:
+            prompt_type, questionnaire_mode, instructor, target = "1", "120-180", group_key[0], group_key[1]
+        pair_label = f"{instructor} -> {target} [P{prompt_type} | Q{questionnaire_mode}]"
+        pair_df = pair_df.copy().sort_values(by=["case"])
+
+        for _, r in pair_df.iterrows():
+            row: Dict[str, Any] = {
+                "Pair": pair_label,
+                "Case": r.get("case"),
+            }
+            ocean_vals = []
+            for domain in DOMAIN_ORDER:
+                val = r.get(f"aligned_{domain}")
+                row[domain] = val
+                if pd.notna(val):
+                    ocean_vals.append(float(val))
+            row["O_mean"] = round(float(np.mean(ocean_vals)), 4) if ocean_vals else None
+
+            facet_vals = []
+            for facet in FACET_ORDER:
+                col = facet_alignment_col(facet)
+                val = r.get(col)
+                short = facet_short_name(facet)
+                row[short] = val
+                if pd.notna(val):
+                    facet_vals.append(float(val))
+            row["F_mean"] = round(float(np.mean(facet_vals)), 4) if facet_vals else None
+            rows.append(row)
+
+        avg: Dict[str, Any] = {"Pair": pair_label, "Case": "AVG"}
+        numeric_cols = [*DOMAIN_ORDER, "O_mean", *[facet_short_name(f) for f in FACET_ORDER], "F_mean"]
+        for col in numeric_cols:
+            vals = pd.to_numeric(pd.Series([row.get(col) for row in rows if row.get("Pair") == pair_label and row.get("Case") != "AVG"]), errors="coerce")
+            avg[col] = round(float(vals.mean()), 4) if vals.notna().any() else None
+        rows.append(avg)
+
+        # blank separator row between model pairs for readability
+        rows.append({col: "" for col in ["Pair", "Case", *DOMAIN_ORDER, "O_mean", *[facet_short_name(f) for f in FACET_ORDER], "F_mean"]})
+
+    if rows and all(v == "" for v in rows[-1].values()):
+        rows = rows[:-1]
+    return pd.DataFrame(rows)
+
+
+
+def build_combination_comparison(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Cumulative/current model-combo comparison with alignment-only columns."""
+    if results_df.empty:
+        return pd.DataFrame()
+    results_df = ensure_facet_alignment_columns(results_df)
+    rows: List[Dict[str, Any]] = []
+
+    if "prompt_type" in results_df.columns and "questionnaire_mode" in results_df.columns:
+        group_cols = ["prompt_type", "questionnaire_mode", "instructor_model", "target_model"]
+    elif "prompt_type" in results_df.columns:
+        group_cols = ["prompt_type", "instructor_model", "target_model"]
+    else:
+        group_cols = ["instructor_model", "target_model"]
+
+    for group_key, pair_df in results_df.groupby(group_cols, dropna=False):
+        if len(group_cols) == 4:
+            prompt_type, questionnaire_mode, instructor, target = group_key
+        elif len(group_cols) == 3:
+            prompt_type, instructor, target = group_key
+            questionnaire_mode = "120-180"
+        else:
+            prompt_type, questionnaire_mode, instructor, target = "1", "120-180", group_key[0], group_key[1]
+        row: Dict[str, Any] = {
+            "P": prompt_type,
+            "Q": questionnaire_mode,
+            "Instr": instructor,
+            "Target": target,
+            "Pair": f"{instructor} -> {target} [P{prompt_type} | Q{questionnaire_mode}]",
+            "N": int(pair_df["case"].nunique()) if "case" in pair_df.columns else len(pair_df),
+        }
+
+        ocean_vals = []
+        for domain in DOMAIN_ORDER:
+            val = round(float(pd.to_numeric(pair_df.get(f"aligned_{domain}"), errors="coerce").mean()), 4)
+            row[domain] = val
+            if pd.notna(val):
+                ocean_vals.append(val)
+        row["O_mean"] = round(float(np.mean(ocean_vals)), 4) if ocean_vals else None
+
+        facet_vals = []
+        for facet in FACET_ORDER:
+            col = facet_alignment_col(facet)
+            val = round(float(pd.to_numeric(pair_df.get(col), errors="coerce").mean()), 4)
+            short = facet_short_name(facet)
+            row[short] = val
+            if pd.notna(val):
+                facet_vals.append(val)
+        row["F_mean"] = round(float(np.mean(facet_vals)), 4) if facet_vals else None
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(by=["O_mean", "F_mean"], ascending=[True, True]).reset_index(drop=True)
+        out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+def load_cumulative_case_results(current_output_dir: Optional[Path] = None) -> pd.DataFrame:
+    """Load successful partial results across validation_outputs/run_* and de-duplicate by case/model pair.
+
+    This is what keeps the cross-model comparison sheet updating across separate runs.
+    Latest result wins if the same case/instructor/target appears more than once.
+    """
+    records: List[Tuple[float, int, Dict[str, Any]]] = []
+    order = 0
+    for partial_path in sorted(OUTPUT_ROOT.glob(f"*/{PARTIAL_RESULTS_FILENAME}")):
+        try:
+            mtime = partial_path.stat().st_mtime
+            run_id = partial_path.parent.name
+            for line in partial_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                payload["source_run"] = run_id
+                payload["source_output_dir"] = str(partial_path.parent)
+                records.append((mtime, order, payload))
+                order += 1
+        except Exception:
+            continue
+
+    deduped: Dict[Tuple[str, str, str, str, str], Tuple[float, int, Dict[str, Any]]] = {}
+    for mtime, order_idx, payload in records:
+        key = result_unique_key(payload)
+        current = deduped.get(key)
+        if current is None or (mtime, order_idx) >= (current[0], current[1]):
+            deduped[key] = (mtime, order_idx, payload)
+
+    rows = [payload for _, _, payload in sorted(deduped.values(), key=lambda item: (item[0], item[1]))]
+    if not rows:
+        return pd.DataFrame()
+    return ensure_facet_alignment_columns(pd.DataFrame(rows))
+
+
+def build_mean_deviation_sheet(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Long-format human-vs-LLM mean score deviations for OCEAN traits and facets.
+
+    This is separate from alignment scores. Alignment scores compare item-by-item;
+    mean deviation compares the resulting mean trait/facet scores.
+    """
+    if results_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    if "prompt_type" in results_df.columns and "questionnaire_mode" in results_df.columns:
+        group_cols = ["prompt_type", "questionnaire_mode", "instructor_model", "target_model"]
+    elif "prompt_type" in results_df.columns:
+        group_cols = ["prompt_type", "instructor_model", "target_model"]
+    else:
+        group_cols = ["instructor_model", "target_model"]
+
+    for group_key, pair_df in results_df.groupby(group_cols, dropna=False):
+        if len(group_cols) == 4:
+            prompt_type, questionnaire_mode, instructor, target = group_key
+        elif len(group_cols) == 3:
+            prompt_type, instructor, target = group_key
+            questionnaire_mode = "120-180"
+        else:
+            prompt_type, questionnaire_mode, instructor, target = "1", "120-180", group_key[0], group_key[1]
+        pair_label = f"{instructor} -> {target} [P{prompt_type} | Q{questionnaire_mode}]"
+        pair_df = pair_df.copy().sort_values(by=["case"])
+
+        case_rows: List[Dict[str, Any]] = []
+        for _, r in pair_df.iterrows():
+            case_id = r.get("case")
+            for domain in DOMAIN_ORDER:
+                case_rows.append({
+                    "Pair": pair_label,
+                    "Case": case_id,
+                    "Level": "OCEAN",
+                    "Name": domain,
+                    "H": r.get(f"human_{domain}_avg"),
+                    "LLM": r.get(f"model_{domain}_avg"),
+                    "Diff": r.get(f"diff_{domain}_avg"),
+                    "Abs": r.get(f"absdiff_{domain}_avg"),
+                })
+
+            for facet in FACET_ORDER:
+                short = facet_short_name(facet)
+                case_rows.append({
+                    "Pair": pair_label,
+                    "Case": case_id,
+                    "Level": "Facet",
+                    "Name": short,
+                    "H": r.get(f"human_{short}_avg"),
+                    "LLM": r.get(f"model_{short}_avg"),
+                    "Diff": r.get(f"diff_{short}_avg"),
+                    "Abs": r.get(f"absdiff_{short}_avg"),
+                })
+
+        rows.extend(case_rows)
+
+        for level, names in [("OCEAN", DOMAIN_ORDER), ("Facet", [facet_short_name(f) for f in FACET_ORDER])]:
+            for name in names:
+                subset = [x for x in case_rows if x["Level"] == level and x["Name"] == name]
+                avg_row: Dict[str, Any] = {"Pair": pair_label, "Case": "AVG", "Level": level, "Name": name}
+                for col in ["H", "LLM", "Diff", "Abs"]:
+                    vals = pd.to_numeric(pd.Series([x.get(col) for x in subset]), errors="coerce")
+                    avg_row[col] = round(float(vals.mean()), 4) if vals.notna().any() else None
+                rows.append(avg_row)
+
+        rows.append({"Pair": "", "Case": "", "Level": "", "Name": "", "H": "", "LLM": "", "Diff": "", "Abs": ""})
+
+    if rows and all(v == "" for v in rows[-1].values()):
+        rows = rows[:-1]
+    return pd.DataFrame(rows)
+
+
 def write_excel_with_plots(
     results_df: pd.DataFrame,
     ranking_df: pd.DataFrame,
-    stats_df: pd.DataFrame,
+    cumulative_comparison_df: pd.DataFrame,
     output_dir: Path,
     plots: Dict[str, Path],
     logger: logging.Logger,
 ) -> Path:
-    excel_path = output_dir / "multi_model_validation_results.xlsx"
-    prompt_cols = ["case", "instructor_model", "target_model", "model_pair", "instructor_prompt", "validation_system_prompt"]
-
-    export_df = results_df.drop(columns=[c for c in prompt_cols if c in results_df.columns], errors="ignore")
-    prompts_df = results_df[[c for c in prompt_cols if c in results_df.columns]].copy() if all(c in results_df.columns for c in prompt_cols) else pd.DataFrame()
+    """Write a compact workbook:
+    - Alignment Scores: case-level OCEAN/facet item-alignment with AVG rows
+    - Mean Dev: human-vs-LLM mean trait/facet score deviation with AVG rows
+    - Combo Compare: cumulative model-pair comparison that updates across runs
+    - Plots: all plots embedded together
+    """
+    excel_path = output_dir / "alignment_scores.xlsx"
 
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        ranking_df.to_excel(writer, sheet_name="Model Ranking", index=False)
-        export_df.to_excel(writer, sheet_name="All Case Results", index=False)
-        stats_df.to_excel(writer, sheet_name="Statistical Tests", index=False)
+        alignment_df = build_alignment_scores_sheet(results_df)
+        alignment_df.to_excel(writer, sheet_name="Alignment Scores", index=False)
 
-        ocean_cols = ["case", "instructor_model", "target_model", "model_pair"]
-        for d in DOMAIN_ORDER:
-            ocean_cols.extend([f"human_{d}_avg", f"model_{d}_avg", f"diff_{d}_avg", f"absdiff_{d}_avg"])
-        results_df[ocean_cols].to_excel(writer, sheet_name="OCEAN Scores", index=False)
+        mean_dev_df = build_mean_deviation_sheet(results_df)
+        mean_dev_df.to_excel(writer, sheet_name="Mean Dev", index=False)
 
-        mpi_cols = ["case", "instructor_model", "target_model", "model_pair"] + [f"aligned_{d}" for d in DOMAIN_ORDER] + ["aligned_composite"]
-        results_df[mpi_cols].to_excel(writer, sheet_name="MPI Aligned Scores", index=False)
+        # This is cumulative across all trial folders, so it keeps updating as new model combinations are run.
+        cumulative_comparison_df.to_excel(writer, sheet_name="Combo Compare", index=False)
 
-        if not prompts_df.empty:
-            prompts_df.to_excel(writer, sheet_name="Prompts", index=False)
+        # Keep current-run comparison as CSV, but not as another Excel sheet to avoid clutter.
+        # Keep prompts in JSONL, not Excel, because they are too wide for quick reading.
 
     if load_workbook is not None and XLImage is not None:
         try:
             wb = load_workbook(excel_path)
+
+            # Basic readability: freeze top rows and make common numeric columns reasonably narrow.
+            for sheet_name in ["Alignment Scores", "Mean Dev", "Combo Compare"]:
+                if sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    ws.freeze_panes = "A2"
+                    for col_cells in ws.columns:
+                        header = str(col_cells[0].value or "")
+                        width = 8
+                        if header in {"Pair", "Instr", "Target"}:
+                            width = 22
+                        elif header in {"Case", "Level", "Name"}:
+                            width = 10
+                        elif header in {"Rank", "N"}:
+                            width = 6
+                        ws.column_dimensions[col_cells[0].column_letter].width = width
+
+            if "Plots" in wb.sheetnames:
+                del wb["Plots"]
             sheet = wb.create_sheet("Plots")
             row = 1
             for label, path in plots.items():
@@ -1987,27 +3549,176 @@ def write_excel_with_plots(
                 row += 25
             wb.save(excel_path)
         except Exception as e:
-            logger.warning(f"Could not embed plots in Excel: {e}")
+            logger.warning(f"Could not format workbook or embed plots in Excel: {e}")
 
     return excel_path
 
 
+
 def write_jsonl_prompts(results: List[Dict[str, Any]], output_dir: Path) -> Path:
-    path = output_dir / "prompts_and_scores.jsonl"
+    path = output_dir / "prompts_scores.jsonl"
     with path.open("w", encoding="utf-8") as f:
         for row in results:
             payload = {
                 "case": row.get("case"),
                 "instructor_model": row.get("instructor_model"),
                 "target_model": row.get("target_model"),
+                "prompt_type": row.get("prompt_type"),
                 "instructor_prompt": row.get("instructor_prompt"),
                 "validation_system_prompt": row.get("validation_system_prompt"),
-                "human_scores_180": row.get("human_scores_180"),
-                "model_scores_180": row.get("model_scores_180"),
+                "questionnaire_mode": row.get("questionnaire_mode"),
+                "train_items": row.get("train_items"),
+                "test_items": row.get("test_items"),
+                "human_scores_scored": row.get("human_scores_scored"),
+                "model_scores_scored": row.get("model_scores_scored"),
+                "human_scores_raw": row.get("human_scores_raw"),
+                "model_scores_raw": row.get("model_scores_raw"),
             }
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return path
 
+
+
+# =============================================================================
+# Resumable run helpers
+# =============================================================================
+
+def load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def choose_output_dir_for_run(
+    args_output_dir: Optional[str],
+    timestamp: str,
+    selection: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[Path, bool]:
+    """Choose a new model-combo/trial output directory or resume the latest incomplete run."""
+    if args_output_dir:
+        return Path(args_output_dir).expanduser().resolve(), False
+
+    state = load_json_file(RESUME_STATE_FILE)
+    if state and not state.get("completed", False):
+        previous_dir = Path(state.get("output_dir", ""))
+        if previous_dir.exists():
+            print("\n" + "=" * 86)
+            print("PREVIOUS VALIDATION RUN FOUND")
+            print("=" * 86)
+            print(f"Previous output folder: {previous_dir}")
+            print(f"Started at             : {state.get('started_at', 'unknown')}")
+            print(f"Instructor model(s)    : {', '.join(state.get('selection', {}).get('instructors', []))}")
+            print(f"Target model(s)        : {', '.join(state.get('selection', {}).get('targets', []))}")
+            print(f"Prompt type            : {state.get('selection', {}).get('prompt_type', '1')}")
+            print(f"Questionnaire mode     : {state.get('selection', {}).get('questionnaire_mode', '120-180')}")
+            print("\nPress 1 to continue from where it stopped")
+            print("Press 2 to start a new run")
+            choice = input("Choice: ").strip()
+            if choice == "1":
+                print("Continuing previous run. Previous successful case results will be merged into the final outputs.")
+                return previous_dir, True
+
+    if selection is None:
+        return OUTPUT_ROOT / f"trial_{next_trial_number(OUTPUT_ROOT):03d}_model_combo_{timestamp}", False
+    return make_trial_output_dir(selection, timestamp), False
+
+
+
+def save_run_manifest(
+    output_dir: Path,
+    selection: Dict[str, List[str]],
+    csv_path: Path,
+    max_participants: Optional[int],
+    batch_size: int,
+    case_plots: bool,
+    completed: bool = False,
+) -> None:
+    manifest = {
+        "prompt_version": PROMPT_VERSION,
+        "selection": selection,
+        "csv_path": str(csv_path),
+        "max_participants": max_participants,
+        "batch_size": batch_size,
+        "case_plots": case_plots,
+        "output_dir": str(output_dir),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "completed": completed,
+    }
+    save_json_file(output_dir / RUN_MANIFEST_FILENAME, manifest)
+    save_json_file(RESUME_STATE_FILE, manifest)
+
+
+def mark_resume_state_completed(output_dir: Path, completed: bool) -> None:
+    manifest_path = output_dir / RUN_MANIFEST_FILENAME
+    manifest = load_json_file(manifest_path) or {}
+    manifest["completed"] = completed
+    manifest["last_updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_json_file(manifest_path, manifest)
+    save_json_file(RESUME_STATE_FILE, manifest)
+
+
+def result_unique_key(row: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    return (
+        str(row.get("case")),
+        str(row.get("instructor_model")),
+        str(row.get("target_model")),
+        str(row.get("prompt_type", "1")),
+        str(row.get("questionnaire_mode", "120-180")),
+    )
+
+def append_partial_result(output_dir: Path, result: Dict[str, Any]) -> None:
+    partial_path = output_dir / PARTIAL_RESULTS_FILENAME
+    with partial_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+
+def load_partial_results(output_dir: Path) -> List[Dict[str, Any]]:
+    """Load previous successful case results for a resumable run, de-duplicated by case/model pair."""
+    partial_path = output_dir / PARTIAL_RESULTS_FILENAME
+    rows: List[Dict[str, Any]] = []
+    if partial_path.exists():
+        for line in partial_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+
+    # Fallback: if a completed CSV exists but partial_results.jsonl does not, preserve what can be recovered.
+    csv_path = output_dir / "all_case_results.csv"
+    if not rows and csv_path.exists():
+        try:
+            recovered = pd.read_csv(csv_path).to_dict(orient="records")
+            rows.extend(recovered)
+        except Exception:
+            pass
+
+    deduped: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    for row in rows:
+        deduped[result_unique_key(row)] = row
+    return list(deduped.values())
+
+
+def expected_result_keys(df: pd.DataFrame, selection: Dict[str, List[str]]) -> set[Tuple[str, str, str, str, str]]:
+    keys = set()
+    prompt_type = str(selection.get("prompt_type", "1"))
+    questionnaire_mode = str(selection.get("questionnaire_mode", "120-180"))
+    for instructor_key in selection["instructors"]:
+        for target_key in selection["targets"]:
+            for _, row in df.iterrows():
+                keys.add((str(row.get("case", "unknown")), instructor_key, target_key, prompt_type, questionnaire_mode))
+    return keys
 
 # =============================================================================
 # Main validation loop
@@ -2054,12 +3765,13 @@ def process_case_pair(
     target_key: str,
     logger: logging.Logger,
     batch_size: int,
+    prompt_type: str = "1",
 ) -> Dict[str, Any]:
     case_id = str(row.get("case", "unknown"))
 
-    instructor_prompt = generate_instructor_prompt(row, instructor_key, logger)
+    instructor_prompt = generate_instructor_prompt(row, instructor_key, logger, prompt_type=prompt_type)
     calibration = build_training_calibration(row)
-    few_shot = build_few_shot_120(row)
+    few_shot = build_few_shot_train(row, prompt_type=prompt_type)
     system_prompt = build_validation_system_prompt(
         instructor_prompt=instructor_prompt,
         calibration_prompt=calibration,
@@ -2068,27 +3780,32 @@ def process_case_pair(
         target_key=target_key,
         case_id=case_id,
         logger=logger,
+        prompt_type=prompt_type,
     )
 
-    scores_180 = run_target_batches(
+    scores_test = run_target_batches(
         row=row,
         system_prompt=system_prompt,
         target_key=target_key,
         instructor_key=instructor_key,
         logger=logger,
         batch_size=batch_size,
+        prompt_type=prompt_type,
     )
 
     result = compute_case_metrics(
         row=row,
-        model_scores_180=scores_180,
+        model_scores_test=scores_test,
         instructor_key=instructor_key,
         target_key=target_key,
     )
+    result["prompt_type"] = str(prompt_type)
+    result["questionnaire_mode"] = QUESTIONNAIRE_MODE
+    result["model_pair"] = f"{instructor_key} -> {target_key} [P{prompt_type} | Q{QUESTIONNAIRE_MODE}]"
     result["instructor_prompt"] = instructor_prompt
     result["validation_system_prompt"] = system_prompt
     result["training_calibration_prompt"] = calibration
-    result["few_shot_120_prompt"] = few_shot
+    result["few_shot_prompt"] = few_shot
     return result
 
 
@@ -2102,40 +3819,94 @@ def main() -> None:
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) if args.output_dir else OUTPUT_ROOT / f"run_{timestamp}"
+
+    # First handle resume state. If this is a new run, choose models before creating the
+    # output folder so the folder name can contain the model-combo and trial number.
+    resume_probe_dir, resume_previous = choose_output_dir_for_run(args.output_dir, timestamp, selection=None)
+    manifest = load_json_file(resume_probe_dir / RUN_MANIFEST_FILENAME) if resume_previous else None
+
+    if resume_previous and manifest and manifest.get("selection"):
+        output_dir = resume_probe_dir
+        selection = manifest["selection"]
+        print("\nResuming with previous model choice:")
+        print(f"Instructor model(s): {', '.join(selection.get('instructors', []))}")
+        print(f"Target model(s)    : {', '.join(selection.get('targets', []))}")
+        print(f"Prompt type        : {selection.get('prompt_type', '1')} - {prompt_type_description(str(selection.get('prompt_type', '1')))}")
+        print(f"Questionnaire mode : {selection.get('questionnaire_mode', '120-180')} - {questionnaire_mode_description(str(selection.get('questionnaire_mode', '120-180')))}")
+    else:
+        selection = choose_models_interactively()
+        output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else make_trial_output_dir(selection, timestamp)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     plots_dir = output_dir / "plots"
     checkpoints_dir = output_dir / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
 
     logger = setup_logging(output_dir)
+    manifest = load_json_file(output_dir / RUN_MANIFEST_FILENAME) if resume_previous else None
 
-    selection = choose_models_interactively()
+    # Configure the selected questionnaire split before data loading and processing.
+    # Prompt Type 2 now also respects this split; for 180-120 it uses the same FPS wording adapted to the selected item range.
+    configure_questionnaire_split(str(selection.get("questionnaire_mode", "120-180")))
+
     validate_environment(selection)
 
-    if args.max_participants is None:
-        max_participants = ask_max_participants(DEFAULT_MAX_PARTICIPANTS)
+    if resume_previous and manifest:
+        max_participants = manifest.get("max_participants", DEFAULT_MAX_PARTICIPANTS)
+        batch_size = int(manifest.get("batch_size", args.batch_size))
+        case_plots = bool(manifest.get("case_plots", args.case_plots))
+        csv_path = Path(manifest.get("csv_path")).expanduser().resolve() if manifest.get("csv_path") else (Path(args.csv).expanduser().resolve() if args.csv else find_default_csv())
+        logger.info("Resume mode: using previous CSV, participant count, batch size, and model selection.")
     else:
-        max_participants = None if args.max_participants.lower() == "all" else int(args.max_participants)
+        if args.max_participants is None:
+            max_participants = ask_max_participants(DEFAULT_MAX_PARTICIPANTS)
+        else:
+            max_participants = None if args.max_participants.lower() == "all" else int(args.max_participants)
+        batch_size = args.batch_size
+        case_plots = args.case_plots
+        csv_path = Path(args.csv).expanduser().resolve() if args.csv else find_default_csv()
 
-    csv_path = Path(args.csv).expanduser().resolve() if args.csv else find_default_csv()
     df = load_data(csv_path, max_participants=max_participants)
+
+    save_run_manifest(
+        output_dir=output_dir,
+        selection=selection,
+        csv_path=csv_path,
+        max_participants=max_participants,
+        batch_size=batch_size,
+        case_plots=case_plots,
+        completed=False,
+    )
 
     logger.info(f"Loaded {len(df)} participants from {csv_path}")
     logger.info(f"Instructor models: {selection['instructors']}")
     logger.info(f"Target models: {selection['targets']}")
-    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Prompt type: {selection.get('prompt_type', '1')} - {prompt_type_description(str(selection.get('prompt_type', '1')))}")
+    logger.info(f"Questionnaire mode: {selection.get('questionnaire_mode', '120-180')} - {questionnaire_mode_description(str(selection.get('questionnaire_mode', '120-180')))}")
+    logger.info(f"Training items: {TRAIN_RANGE_LABEL}; validation items: {TEST_RANGE_LABEL}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info("Validation comparison scale: reverse-scored personality-direction values for both human and LLM scores")
 
-    all_results: List[Dict[str, Any]] = []
+    all_results: List[Dict[str, Any]] = load_partial_results(output_dir)
+    existing_keys = {result_unique_key(r) for r in all_results}
+    if all_results:
+        logger.info(f"Loaded {len(all_results)} previous successful case results from partial storage.")
 
     for instructor_key in selection["instructors"]:
         for target_key in selection["targets"]:
-            pair_slug = slugify(f"{instructor_key}__to__{target_key}")
+            pair_slug = slugify(f"{instructor_key}__to__{target_key}__p{selection.get('prompt_type', '1')}__q{selection.get('questionnaire_mode', '120-180').replace('-', 'to')}")
             checkpoint_file = checkpoints_dir / f"done_{pair_slug}.txt"
             done = set()
             if checkpoint_file.exists():
                 done = set(line.strip() for line in checkpoint_file.read_text(encoding="utf-8").splitlines() if line.strip())
-                logger.info(f"Resuming pair {instructor_key} -> {target_key} | already done: {len(done)}")
+                logger.info(f"Resuming pair {instructor_key} -> {target_key} | already checkpointed: {len(done)}")
+
+            # The partial results file is the source of truth for final merged outputs.
+            # If a case exists in partial storage, treat it as done even if checkpoint text is missing.
+            done.update({
+                case for case, instr, targ, ptype, qmode in existing_keys
+                if instr == instructor_key and targ == target_key and ptype == str(selection.get("prompt_type", "1")) and qmode == str(selection.get("questionnaire_mode", "120-180"))
+            })
 
             logger.info("=" * 86)
             logger.info(f"Starting model pair: {instructor_key} -> {target_key}")
@@ -2144,7 +3915,7 @@ def main() -> None:
             for i, (_, row) in enumerate(df.iterrows(), start=1):
                 case_id = str(row.get("case", "unknown"))
                 if case_id in done:
-                    logger.info(f"Skipping case {case_id} for {pair_slug} (checkpoint)")
+                    logger.info(f"Skipping case {case_id} for {pair_slug} (already completed)")
                     continue
 
                 logger.info(f"[{i}/{len(df)}] case {case_id} | {instructor_key} -> {target_key}")
@@ -2154,85 +3925,113 @@ def main() -> None:
                         instructor_key=instructor_key,
                         target_key=target_key,
                         logger=logger,
-                        batch_size=args.batch_size,
+                        batch_size=batch_size,
+                        prompt_type=str(selection.get("prompt_type", "1")),
                     )
-                    all_results.append(result)
+                    key = result_unique_key(result)
+                    if key not in existing_keys:
+                        all_results.append(result)
+                        existing_keys.add(key)
+                        append_partial_result(output_dir, result)
 
                     with checkpoint_file.open("a", encoding="utf-8") as f:
                         f.write(case_id + "\n")
 
                     logger.info(
                         f"  OK case {case_id} | pair={instructor_key} -> {target_key} | "
-                        f"r={result['pearson_r_180']} | mae={result['mae_180']} | "
-                        f"aligned={result['aligned_composite']} | exact={result['exact_match_pct_180']}%"
+                        f"aligned={result['aligned_composite']} | "
+                        f"O_mean={result.get('aligned_ocean_mean')} | F_mean={result.get('aligned_facet_mean')} | "
+                        f"scale=reverse-scored"
                     )
 
-                    if args.case_plots:
+                    if case_plots:
                         plot_case_line(
                             case_id=case_id,
-                            human=json.loads(result["human_scores_180"]),
-                            model=json.loads(result["model_scores_180"]),
+                            human=json.loads(result["human_scores_scored"]),
+                            model=json.loads(result["model_scores_scored"]),
                             pair_slug=pair_slug,
                             plots_dir=plots_dir,
                         )
 
+                except KeyboardInterrupt:
+                    logger.warning("Interrupted by user. Successful cases so far have been saved to partial_results.jsonl.")
+                    mark_resume_state_completed(output_dir, completed=False)
+                    raise
                 except Exception as e:
                     logger.error(f"  FAILED case {case_id} | pair={pair_slug} | {repr(e)}")
                     time.sleep(1.0)
                     continue
 
-    # If this run resumed and skipped all cases, rebuild from caches is not implemented.
-    # The result file will include newly completed cases from this run only.
     if not all_results:
-        logger.warning("No new results were generated in this run. Remove checkpoints or choose unfinished pairs if you expected output.")
+        logger.warning("No results were available. Nothing to export yet.")
+        mark_resume_state_completed(output_dir, completed=False)
         return
 
-    results_df = pd.DataFrame(all_results)
+    results_df = ensure_facet_alignment_columns(pd.DataFrame(all_results))
     ranking_df = build_model_ranking(results_df)
-    stats_df = build_statistical_tests(results_df)
+    current_comparison_df = build_combination_comparison(results_df)
 
-    # Save raw tabular outputs
-    results_csv = output_dir / "all_case_results.csv"
-    ranking_csv = output_dir / "model_ranking.csv"
-    stats_csv = output_dir / "statistical_tests.csv"
-    results_df.drop(columns=["instructor_prompt", "validation_system_prompt", "training_calibration_prompt", "few_shot_120_prompt"], errors="ignore").to_csv(results_csv, index=False)
+    cumulative_results_df = load_cumulative_case_results(current_output_dir=output_dir)
+    if cumulative_results_df.empty:
+        cumulative_results_df = results_df.copy()
+    cumulative_comparison_df = build_combination_comparison(cumulative_results_df)
+
+    # Save only alignment-focused summary files. Case-matrix and domain-stats exports are intentionally omitted.
+    ranking_csv = output_dir / "model_combo_ranking.csv"
+    current_comparison_csv = output_dir / "combo_summary_current.csv"
+    alignment_csv = output_dir / "alignment_scores_current.csv"
+    mean_dev_csv = output_dir / "mean_deviation_current.csv"
+    build_alignment_scores_sheet(results_df).to_csv(alignment_csv, index=False)
+    build_mean_deviation_sheet(results_df).to_csv(mean_dev_csv, index=False)
     ranking_df.to_csv(ranking_csv, index=False)
-    stats_df.to_csv(stats_csv, index=False)
+    current_comparison_df.to_csv(current_comparison_csv, index=False)
+    cumulative_comparison_df.to_csv(CUMULATIVE_COMPARISON_CSV, index=False)
     prompts_jsonl = write_jsonl_prompts(all_results, output_dir)
 
-    # Plots
+    # Plots use reverse-scored values for all comparison/difference visualisations.
     plots: Dict[str, Path] = {}
-    plots["Ranking by aligned composite"] = plot_ranking_bar(ranking_df, plots_dir)
-    plots["Ranking by MAE"] = plot_mae_bar(ranking_df, plots_dir)
+    plots["Ranking by alignment score"] = plot_ranking_bar(ranking_df, plots_dir)
+    plots["Ranking by facet mean alignment"] = plot_facet_mean_bar(ranking_df, plots_dir)
     plots["OCEAN absolute-difference heatmap"] = plot_ocean_absdiff_heatmap(ranking_df, results_df, plots_dir)
 
     for pair, pair_df in results_df.groupby("model_pair"):
         pair_slug = slugify(pair)
-        plots[f"OCEAN bars - {pair}"] = plot_pair_ocean_bars(pair_df, pair_slug, plots_dir)
-        plots[f"Score distribution - {pair}"] = plot_pair_score_distribution(pair_df, pair_slug, plots_dir)
-        plots[f"Difference violin - {pair}"] = plot_pair_violin(pair_df, pair_slug, plots_dir)
+        plots[f"OCEAN bars — {pair}"] = plot_pair_ocean_bars(pair_df, pair_slug, plots_dir)
+        plots[f"Reverse-scored score distribution — {pair}"] = plot_pair_score_distribution(pair_df, pair_slug, plots_dir)
+        plots[f"Reverse-scored difference violin — {pair}"] = plot_pair_violin(pair_df, pair_slug, plots_dir)
 
     excel_path = write_excel_with_plots(
         results_df=results_df,
         ranking_df=ranking_df,
-        stats_df=stats_df,
+        cumulative_comparison_df=cumulative_comparison_df,
         output_dir=output_dir,
         plots=plots,
         logger=logger,
     )
 
-    print("\n" + "=" * 86)
-    print("VALIDATION COMPLETE")
-    print("=" * 86)
+    expected_keys = expected_result_keys(df, selection)
+    completed = expected_keys.issubset({result_unique_key(r) for r in all_results})
+    mark_resume_state_completed(output_dir, completed=completed)
+
+    logger.info("=" * 86)
+    logger.info("DONE")
+    logger.info(f"Run completion status: {'complete' if completed else 'incomplete — restart will offer resume'}")
+    logger.info(f"Excel alignment workbook: {excel_path}")
+    logger.info(f"Alignment scores CSV: {alignment_csv}")
+    logger.info(f"Mean deviation CSV: {mean_dev_csv}")
+    logger.info(f"Model ranking CSV: {ranking_csv}")
+    logger.info(f"Current combo summary CSV: {current_comparison_csv}")
+    logger.info(f"Cumulative comparison CSV: {CUMULATIVE_COMPARISON_CSV}")
+    logger.info(f"Prompts JSONL: {prompts_jsonl}")
+
+    print("\nValidation finished." if completed else "\nValidation exported, but some expected cases/pairs are still incomplete.")
     print(f"Output folder : {output_dir}")
-    print(f"Excel workbook: {excel_path}")
-    print(f"Case results  : {results_csv}")
-    print(f"Ranking CSV   : {ranking_csv}")
-    print(f"Stats CSV     : {stats_csv}")
+    print(f"Excel         : {excel_path}")
+    print(f"Alignment CSV : {alignment_csv}")
+    print(f"Mean dev CSV  : {mean_dev_csv}")
+    print(f"Ranking       : {ranking_csv}")
     print(f"Prompts JSONL : {prompts_jsonl}")
-    print(f"Plots folder  : {plots_dir}")
-    print("\nTop ranking:")
-    print(ranking_df.head(10).to_string(index=False))
+    print("\nAlignment metrics use reverse-scored values for both human and LLM responses. Questionnaire split is configurable; case-matrix and domain-stats exports are removed.")
 
 
 if __name__ == "__main__":

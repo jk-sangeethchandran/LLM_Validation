@@ -1,4 +1,5 @@
 .env
+.validation_model_selection.json
 .venv/
 *.csv
 *.xlsx
