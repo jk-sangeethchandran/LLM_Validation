@@ -3,6 +3,7 @@
 .venv/
 *.csv
 *.xlsx
+*.zip
 *.log
 .validation_cache/
 validation_outputs/

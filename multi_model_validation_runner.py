@@ -12,10 +12,10 @@ What it does:
    facet-by-facet personality control prompt.
 4. The target model receives:
       - the instructor-generated personality prompt
-      - calibration statistics from the selected training split
-      - labelled training-item examples
-   Then it answers the selected held-out validation items.
-   Prompt Type 2 uses the FPS prompt path and now allows either questionnaire split: 120-180 or 180-120.
+      - calibration statistics from the first 180 items
+      - labelled first-180 item examples
+   Then it answers items 181-300.
+   This v10 split uses items 1-180 as target anchors and items 181-300 as validation items.
 5. Runs all selected instructor × target combinations.
 6. Caches instructor prompts, system prompts, target batches, and OpenAI prompt-cache hints where supported.
 7. Compares human vs LLM answers after reverse coding both sides for trait-direction metrics.
@@ -28,7 +28,7 @@ Install in the same venv:
 
 Expected files beside this script, unless overridden:
     .env
-    IPIP_NEO_300.csv   OR   prosocial_antisocial_ipip300_answers.csv
+    selected_50_raw_IPIP_NEO_300_items.csv
 
 Relevant .env variables:
     OPENAI_API_KEY=...
@@ -36,7 +36,7 @@ Relevant .env variables:
     GROQ_API_KEY_2=...               # optional Groq fallback key
     GROQ_API_KEY_3=...               # optional Groq fallback key
     GROQ_API_KEY_TUD=...             # optional Groq fallback key
-    GEMINI_API_KEY=...               # Google AI Studio / Gemini API key, only needed for Gemma/Gemini/Live
+    GEMINI_API_KEY=...               # Google AI Studio / Gemini API key, only needed for Gemma
     GOOGLE_AI_STUDIO_API_KEY=...     # optional alternative env name
     GOOGLE_API_KEY=...               # optional alternative env name
 
@@ -47,10 +47,10 @@ Optional Groq throttling controls:
     GROQ_TOKEN_BUFFER=150
     GROQ_THROTTLE_ENABLED=1
     GROQ_KEY_ROTATE_AFTER_SECONDS=120   # rotate Groq key if retry hint is >= this long
-    GROQ_SKIP_OVERSIZE_SLEEP=1           # do not sleep 60s for single requests above current TPM limit
-    GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS=400  # exact FPS script used max_tokens=400 for Llama narrative
 
-Gemma/Gemini models are called through Google AI Studio / Gemini API using the google-genai SDK. Gemini 3.1 Flash Live Preview uses the Gemini Live API text mode.
+Gemma/Gemini models are called through Google AI Studio / Gemini API using the google-genai SDK.
+Gemini 3 Flash Preview is included as a normal text model using official model ID gemini-3-flash-preview.
+Instructor prompts are also saved in .validation_cache/durable_instructor_prompt_cache.json so the same case + instructor + prompt type + questionnaire split is reused across future target-combo runs.
 """
 
 from __future__ import annotations
@@ -68,7 +68,6 @@ import re
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -101,11 +100,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_FILE, override=True)
 
-PROMPT_VERSION = "multi_model_validation_v30_google_csv_scores"
+PROMPT_VERSION = "multi_model_validation_v19_gemma_target_batch_override"
 SELECTION_FILE = SCRIPT_DIR / ".validation_model_selection.json"
 CACHE_DIR = SCRIPT_DIR / ".validation_cache"
 OUTPUT_ROOT = SCRIPT_DIR / "validation_outputs"
 RESUME_STATE_FILE = OUTPUT_ROOT / "_latest_resume_state.json"
+REQUIRED_DATASET_NAME = "selected_50_raw_IPIP_NEO_300_items.csv"
+REQUIRED_DATASET_PATH = SCRIPT_DIR / REQUIRED_DATASET_NAME
 PARTIAL_RESULTS_FILENAME = "partial_results.jsonl"
 RUN_MANIFEST_FILENAME = "run_manifest.json"
 CUMULATIVE_COMPARISON_CSV = OUTPUT_ROOT / "combo_summary_cumulative.csv"
@@ -114,38 +115,26 @@ OUTPUT_ROOT.mkdir(exist_ok=True)
 
 DEFAULT_MAX_PARTICIPANTS = 10
 DEFAULT_BATCH_SIZE = 30
-# Llama/Groq as TARGET can exceed the 6000 TPM tier when the persona prompt is long.
-# Smaller target batches keep each single Groq request below the on-demand TPM limit.
-LLAMA_TARGET_BATCH_SIZE = int(os.getenv("LLAMA_TARGET_BATCH_SIZE", "20"))
-# Google target batching:
-# - Gemma target is slow/unreliable on one huge request, so default to 30-item chunks
-#   and run those chunks in parallel to reduce wall-clock time.
-# - Gemini Flash/Flash-Lite can usually handle the full held-out split in one call.
-#
-# Set GEMMA_TARGET_BATCH_SIZE=60 or 120 if you still want larger Gemma chunks.
-# Set GOOGLE_TARGET_PARALLEL=0 if Google AI Studio rate limits parallel calls.
-GEMMA_TARGET_BATCH_SIZE = int(os.getenv("GEMMA_TARGET_BATCH_SIZE", "30"))
-# Gemini Flash/Lite can be fast, but long JSON arrays often truncate when the prompt is large.
-# Default to 30 for reliability; adaptive fallback can split further to 15 if needed.
-GEMINI_FLASH_TARGET_BATCH_SIZE = int(os.getenv("GEMINI_FLASH_TARGET_BATCH_SIZE", os.getenv("GEMINI_TARGET_BATCH_SIZE", "15")))
-GOOGLE_TARGET_PARALLEL = (os.getenv("GOOGLE_TARGET_PARALLEL", "1").strip() != "0")
-GOOGLE_TARGET_MAX_WORKERS = int(os.getenv("GOOGLE_TARGET_MAX_WORKERS", "4"))
-# Google API throttling. If you are on paid Tier 1, raise GOOGLE_RPM_LIMIT in .env.
-# Defaults are no longer hard-coded to the free-tier 5 RPM because that caused unnecessary waiting after billing was enabled.
-GOOGLE_THROTTLE_ENABLED = (os.getenv("GOOGLE_THROTTLE_ENABLED", "1").strip() != "0")
-GOOGLE_RPM_LIMIT = int(os.getenv("GOOGLE_RPM_LIMIT", "60"))
-GOOGLE_RPM_SAFETY = float(os.getenv("GOOGLE_RPM_SAFETY", "0.90"))
-GOOGLE_MIN_INTERVAL_SECONDS = float(os.getenv("GOOGLE_MIN_INTERVAL_SECONDS", "1.0"))
-TARGET_PARSE_RETRIES = int(os.getenv("TARGET_PARSE_RETRIES", "2"))
-# If a Google target batch returns incomplete/truncated JSON, split that batch recursively.
-GOOGLE_ADAPTIVE_BATCH_SPLIT = (os.getenv("GOOGLE_ADAPTIVE_BATCH_SPLIT", "1").strip() != "0")
-GOOGLE_MIN_TARGET_BATCH_SIZE = int(os.getenv("GOOGLE_MIN_TARGET_BATCH_SIZE", "15"))
 DEFAULT_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none").strip() or "none"
 DEFAULT_OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_INSTRUCTOR_MAX_TOKENS = int(os.getenv("INSTRUCTOR_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
-GOOGLE_LIVE_TIMEOUT_SECONDS = float(os.getenv("GOOGLE_LIVE_TIMEOUT_SECONDS", "120"))
 DEFAULT_GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1800"))
+
+# Optional Gemini 3 thinking control. Use "minimal" or "low" for validation target scoring.
+# Set GOOGLE_THINKING_LEVEL=none/off/disabled to omit thinking_config.
+GOOGLE_THINKING_LEVEL = os.getenv("GOOGLE_THINKING_LEVEL", "minimal").strip().lower()
+GOOGLE_TARGET_SCORE_FORMAT = os.getenv("GOOGLE_TARGET_SCORE_FORMAT", "csv").strip().lower()  # csv is more reliable than JSON mode for Gemini target scoring
+
+# Google target batching.
+# Gemini 3 Flash often returns only ~100 scores when asked for 120 in one call.
+# Use smaller batches and adaptively split any batch that returns too few scores.
+GEMINI_TARGET_BATCH_SIZE = int(os.getenv("GEMINI_TARGET_BATCH_SIZE", "30"))
+GEMINI3_TARGET_BATCH_SIZE = int(os.getenv("GEMINI3_TARGET_BATCH_SIZE", os.getenv("GEMINI_TARGET_BATCH_SIZE", "30")))
+GEMMA_TARGET_BATCH_SIZE = int(os.getenv("GEMMA_TARGET_BATCH_SIZE", "30"))
+GOOGLE_ADAPTIVE_BATCH_SPLIT = (os.getenv("GOOGLE_ADAPTIVE_BATCH_SPLIT", "1").strip() != "0")
+GOOGLE_MIN_TARGET_BATCH_SIZE = int(os.getenv("GOOGLE_MIN_TARGET_BATCH_SIZE", "10"))
+TARGET_PARSE_RETRIES = int(os.getenv("TARGET_PARSE_RETRIES", "2"))
 
 # Groq/Llama on-demand tiers often fail because of TPM rather than context length.
 # The defaults below are deliberately conservative for the common 6000 TPM on-demand limit.
@@ -157,8 +146,6 @@ GROQ_MIN_INTERVAL_SECONDS = float(os.getenv("GROQ_MIN_INTERVAL_SECONDS", "1.0"))
 GROQ_EST_CHARS_PER_TOKEN = float(os.getenv("GROQ_EST_CHARS_PER_TOKEN", "4.0"))
 GROQ_TOKEN_BUFFER = int(os.getenv("GROQ_TOKEN_BUFFER", "150"))
 GROQ_KEY_ROTATE_AFTER_SECONDS = float(os.getenv("GROQ_KEY_ROTATE_AFTER_SECONDS", "120"))
-GROQ_SKIP_OVERSIZE_SLEEP = (os.getenv("GROQ_SKIP_OVERSIZE_SLEEP", "1").strip() != "0")
-GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS", "400"))
 
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 
@@ -637,26 +624,21 @@ AVAILABLE_MODELS: Dict[str, ModelSpec] = {
         model_id="gemma-4-31b-it",
         notes="Google AI Studio / Gemini API via google-genai",
     ),
-    "gemini-2.5-flash": ModelSpec(
-        key="gemini-2.5-flash",
-        display="Gemini 2.5 Flash",
+    "gemini-3.1-flash-preview": ModelSpec(
+        key="gemini-3.1-flash-preview",
+        display="Gemini 3 Flash Preview",
         provider="google_genai",
-        model_id="gemini-2.5-flash",
-        notes="Google AI Studio / Gemini API; faster target/instructor option",
+        # Official Gemini API text model ID is gemini-3-flash-preview.
+        # The selection key keeps your requested 3.1 naming in the menu.
+        model_id="gemini-3-flash-preview",
+        notes="Google Gemini API text model; official model ID: gemini-3-flash-preview",
     ),
-    "gemini-2.5-flash-lite": ModelSpec(
-        key="gemini-2.5-flash-lite",
-        display="Gemini 2.5 Flash-Lite",
+    "gemini-3.1-flash-lite-preview": ModelSpec(
+        key="gemini-3.1-flash-lite-preview",
+        display="Gemini 3.1 Flash-Lite Preview",
         provider="google_genai",
-        model_id="gemini-2.5-flash-lite",
-        notes="Google AI Studio / Gemini API; fastest/cheapest target option",
-    ),
-    "gemini-3.1-flash-live-preview": ModelSpec(
-        key="gemini-3.1-flash-live-preview",
-        display="Gemini 3.1 Flash Live Preview",
-        provider="google_live",
-        model_id="gemini-3.1-flash-live-preview",
-        notes="Google Gemini Live API; text-only validation mode",
+        model_id="gemini-3.1-flash-lite-preview",
+        notes="Google Gemini API text model; cost-efficient Gemini 3.1 option",
     ),
     "llama-3.1-8b-instant": ModelSpec(
         key="llama-3.1-8b-instant",
@@ -711,6 +693,8 @@ def model_short_name(model_key: str) -> str:
         "gpt-realtime-1.5": "realtime15",
         "gemma-4-26b-a4b-it": "gemma26b",
         "gemma-4-31b-it": "gemma31b",
+        "gemini-3.1-flash-preview": "gemini3flash",
+        "gemini-3.1-flash-lite-preview": "gemini31lite",
         "llama-3.1-8b-instant": "llama31_8b",
     }
     return aliases.get(model_key, slugify(model_key)[:12])
@@ -840,11 +824,16 @@ def save_json_cache(path: Path, data: Dict[str, Any]) -> None:
 
 
 INSTRUCTOR_CACHE_FILE = CACHE_DIR / "instructor_prompt_cache.json"
+# Durable instructor cache is deliberately independent of PROMPT_VERSION.
+# It prevents paying for the same participant + instructor model + prompt type + questionnaire split again
+# when you test the same instructor across different targets or after small script revisions.
+DURABLE_INSTRUCTOR_CACHE_FILE = CACHE_DIR / "durable_instructor_prompt_cache.json"
 SYSTEM_PROMPT_CACHE_FILE = CACHE_DIR / "validation_system_prompt_cache.json"
 TARGET_BATCH_CACHE_FILE = CACHE_DIR / "target_batch_scores_cache.json"
 RAW_TEXT_CACHE_FILE = CACHE_DIR / "raw_text_generation_cache.json"
 
 INSTRUCTOR_CACHE = load_json_cache(INSTRUCTOR_CACHE_FILE)
+DURABLE_INSTRUCTOR_CACHE = load_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE)
 SYSTEM_PROMPT_CACHE = load_json_cache(SYSTEM_PROMPT_CACHE_FILE)
 TARGET_BATCH_CACHE = load_json_cache(TARGET_BATCH_CACHE_FILE)
 RAW_TEXT_CACHE = load_json_cache(RAW_TEXT_CACHE_FILE)
@@ -920,7 +909,7 @@ def parse_model_selection(raw: str) -> List[str]:
 def prompt_type_description(prompt_type: str) -> str:
     pt = str(prompt_type)
     if pt == "2":
-        return "Prompt Type 2 — FPS prompt path: instructor and target prompts from the uploaded FPS validation script, adapted to chosen split"
+        return "Prompt Type 2 — exact FPS prompt: instructor and target prompts copied from the uploaded FPS validation script"
     if pt == "3":
         return "Prompt Type 3 — FPS instructor + original/current target prompt"
     return "Prompt Type 1 — current validation system: direct second-person validation prompt"
@@ -939,8 +928,8 @@ def choose_prompt_type_interactively(selection: Dict[str, Any]) -> Dict[str, Any
     print("\nChoose prompt system:")
     print("  1. Prompt Type 1 — current system")
     print("     Direct second-person validation prompt generated specifically for the target LLM.")
-    print("  2. Prompt Type 2 — FPS prompt path")
-    print("     Uses the same FPS-style instructor narrative prompt and target adoption prompt; for 180-120, item-range wording is adapted.")
+    print("  2. Prompt Type 2 — exact FPS prompt")
+    print("     Uses the same instructor narrative prompt and target adoption prompt as the uploaded FPS validation script.")
     print("  3. Prompt Type 3 — FPS instructor + original target prompt")
     print("     Instructor uses the uploaded FPS-style prompt, but target uses the original/current validation target prompt.")
 
@@ -948,7 +937,6 @@ def choose_prompt_type_interactively(selection: Dict[str, Any]) -> Dict[str, Any
     if raw not in {"1", "2", "3"}:
         raw = current
     selection["prompt_type"] = raw
-
     save_selection(selection)
     print("Using", prompt_type_description(raw))
     return choose_questionnaire_mode_interactively(selection)
@@ -1058,14 +1046,14 @@ def validate_environment(selection: Dict[str, List[str]]) -> None:
     if "groq_chat" in providers:
         if not GROQ_API_KEY:
             missing.append("GROQ_API_KEY or GROQ_API_KEY_2 or GROQ_API_KEY_3 or GROQ_API_KEY_TUD")
-    if "google_genai" in providers or "google_live" in providers:
+    if "google_genai" in providers:
         if not GEMINI_API_KEY:
             missing.append("GEMINI_API_KEY or GOOGLE_AI_STUDIO_API_KEY or GOOGLE_API_KEY")
     if missing:
         raise RuntimeError("Missing required environment variable(s): " + ", ".join(missing))
 
-    if "google_genai" in providers or "google_live" in providers:
-        print("\nGoogle AI Studio / Gemini API selected for Google/Gemma/Gemini.")
+    if "google_genai" in providers:
+        print("\nGoogle AI Studio / Gemini API selected for Gemma.")
         print(f"  GEMINI_API_KEY / GOOGLE_AI_STUDIO_API_KEY / GOOGLE_API_KEY = {'set' if GEMINI_API_KEY else 'not set'}\n")
 
 
@@ -1075,10 +1063,6 @@ _GROQ_CLIENT = None
 _GROQ_CLIENT_KEY_NAME: Optional[str] = None
 _GROQ_KEY_INDEX = 0
 _GOOGLE_GENAI_CLIENT = None
-
-_GOOGLE_THROTTLE_LOCK = threading.Lock()
-_GOOGLE_CALL_HISTORY: List[float] = []
-_GOOGLE_LAST_CALL_AT = 0.0
 
 _GROQ_THROTTLE_LOCK = threading.Lock()
 _GROQ_CALL_HISTORY: List[Tuple[float, int, str]] = []
@@ -1162,41 +1146,6 @@ def get_google_genai_client():
     return _GOOGLE_GENAI_CLIENT
 
 
-def reserve_google_rpm_capacity(logger: logging.Logger, purpose: str) -> None:
-    """Throttle Google AI Studio / Gemini API calls for free-tier RPM limits.
-
-    This prevents rapid repeated requests from hitting errors like:
-    GenerateRequestsPerMinutePerProjectPerModel-FreeTier, quotaValue=5.
-    """
-    global _GOOGLE_LAST_CALL_AT, _GOOGLE_CALL_HISTORY
-    if not GOOGLE_THROTTLE_ENABLED:
-        return
-
-    with _GOOGLE_THROTTLE_LOCK:
-        now = time.time()
-        _GOOGLE_CALL_HISTORY = [t for t in _GOOGLE_CALL_HISTORY if now - t < 60.0]
-
-        waits: List[float] = []
-        since_last = now - _GOOGLE_LAST_CALL_AT if _GOOGLE_LAST_CALL_AT else 999.0
-        if since_last < GOOGLE_MIN_INTERVAL_SECONDS:
-            waits.append(GOOGLE_MIN_INTERVAL_SECONDS - since_last)
-
-        effective_limit = max(1, int(math.floor(GOOGLE_RPM_LIMIT * GOOGLE_RPM_SAFETY)))
-        if len(_GOOGLE_CALL_HISTORY) >= effective_limit:
-            waits.append(max(0.0, 60.0 - (now - min(_GOOGLE_CALL_HISTORY)) + 0.5))
-
-        wait_seconds = max(waits) if waits else 0.0
-        if wait_seconds > 0:
-            logger.info(f"    Google throttle before {purpose}: waiting {wait_seconds:.1f}s "
-                        f"(rpm_limit={GOOGLE_RPM_LIMIT}, recent_calls={len(_GOOGLE_CALL_HISTORY)})")
-            time.sleep(wait_seconds)
-            now = time.time()
-            _GOOGLE_CALL_HISTORY = [t for t in _GOOGLE_CALL_HISTORY if now - t < 60.0]
-
-        _GOOGLE_CALL_HISTORY.append(time.time())
-        _GOOGLE_LAST_CALL_AT = time.time()
-
-
 # =============================================================================
 # Retry and parsing helpers
 # =============================================================================
@@ -1214,18 +1163,6 @@ def is_temporary_server_error(exc: Exception) -> bool:
         "gateway timeout", "connection reset", "timed out", "timeout",
         "connection error", "server disconnected",
     ])
-
-
-def is_realtime_empty_output_error(exc: Exception) -> bool:
-    """OpenAI Realtime can occasionally complete without a text item.
-    Treat it as a transient provider failure and retry the same target batch.
-    """
-    text = str(exc).lower()
-    return (
-        "realtime response completed without text output" in text
-        or "realtime connection closed before response.done" in text
-        or "completed without text output" in text
-    )
 
 
 def safe_get_header(exc: Exception, key: str) -> Optional[str]:
@@ -1250,12 +1187,6 @@ def _parse_retry_after_seconds_from_text(text: str) -> Optional[float]:
         minutes = float(m.group(1))
         seconds = float(m.group(2) or 0)
         return minutes * 60 + seconds
-    m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", lowered)
-    if m:
-        return float(m.group(1))
-    m = re.search(r'retrydelay[\'\"]?\s*[:=]\s*[\'\"]?([0-9]+(?:\.[0-9]+)?)s', lowered)
-    if m:
-        return float(m.group(1))
     return None
 
 
@@ -1286,20 +1217,9 @@ def retry_hint_seconds(exc: Exception) -> Optional[float]:
     return _parse_retry_after_seconds_from_text(str(exc))
 
 
-def is_groq_single_request_too_large(exc: Exception) -> bool:
-    """Detect Groq's 413 TPM/request-size error for one oversized request."""
-    text = str(exc).lower()
-    return (
-        ("413" in text and "request too large" in text)
-        or ("requested" in text and "limit" in text and "tokens per minute" in text and "tpm" in text)
-    )
-
-
 def should_rotate_groq_key(exc: Exception) -> bool:
-    if not is_rate_limit_error(exc) and not is_groq_single_request_too_large(exc):
+    if not is_rate_limit_error(exc):
         return False
-    if is_groq_single_request_too_large(exc):
-        return len(GROQ_API_KEY_ENTRIES) > 1
     hint = retry_hint_seconds(exc)
     if hint is None:
         return False
@@ -1340,19 +1260,15 @@ def reserve_groq_tpm_capacity(
     hard_limit = max(1, GROQ_TPM_LIMIT)
     safe_limit = max(1, int(hard_limit * GROQ_TPM_SAFETY))
 
-    # If one request is itself above the current key/account TPM limit, waiting cannot make
-    # that single request legal on this key. Do not add it to the rolling TPM history and do
-    # not sleep for 60s. Let call_groq_chat try it immediately; on Groq's 413/TPM error,
-    # call_model_text will rotate to the next configured Groq key.
+    # If one request is itself above the safety limit, allow one such request per window,
+    # but warn if it is above the actual account TPM limit.
     effective_limit = max(safe_limit, min(estimate, hard_limit))
     if estimate > hard_limit:
         logger.warning(
             f"    Groq request estimate for {purpose} is {estimate} tokens, above GROQ_TPM_LIMIT={hard_limit}. "
-            "Skipping proactive sleep and trying configured Groq keys immediately. "
-            "If every key has the same TPM limit, this exact Prompt Type 2 Llama request cannot run on Groq on-demand; "
-            "use a higher-limit Groq key, a non-Groq instructor, or Prompt Type 1/3."
+            "Reduce GROQ_MAX_OUTPUT_TOKENS / INSTRUCTOR_MAX_OUTPUT_TOKENS or use compact prompts."
         )
-        return estimate
+        effective_limit = estimate
 
     while True:
         with _GROQ_THROTTLE_LOCK:
@@ -1402,23 +1318,11 @@ def extract_json_candidate(text: str) -> str:
     return candidates[0]
 
 
-def parse_scores_from_incomplete_text(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
-    """Recover score lists from incomplete/truncated JSON-like model output.
 
-    This is mainly for Gemini/Gemma target calls where the text can look like
-    {"scores": [5, 4, ... without a closing bracket. We only recover numeric
-    score values (1-5), and we never use item text.
-    """
+def parse_scores_from_text_fallback(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
+    """Recover score-only outputs from JSON-like, CSV-like, or truncated text."""
     text = raw_text or ""
     requested_items = [int(x) for x in item_numbers] if item_numbers is not None else []
-
-    # Preferred Google target format in v30: plain comma-separated scores, e.g. 3,4,1,5.
-    # Accept it only when the text is almost entirely score punctuation, avoiding prose.
-    csv_like = text.strip()
-    csv_values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', csv_like)]
-    csv_noise = re.sub(r"[1-5,;\\s\\n\\r\\t`\\[\\]{}()\"']", '', csv_like)
-    if len(csv_values) >= expected_n and len(csv_noise) <= 8:
-        return csv_values[:expected_n]
 
     if requested_items:
         pairs = re.findall(r'["\']?([0-9]{1,3})["\']?\s*:\s*([1-5])(?=\D|$)', text)
@@ -1428,78 +1332,50 @@ def parse_scores_from_incomplete_text(raw_text: str, expected_n: int, item_numbe
 
     lowered = text.lower()
     idx = lowered.find("scores")
-    if idx != -1:
-        tail = text[idx:]
-        values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', tail)]
-        if len(values) >= expected_n:
-            return values[:expected_n]
-
-    # Last resort only for outputs that appear to be pure score material, not prose.
-    compact = re.sub(r'[`\s,\[\]{}:"scoresA-Za-z_/-]', '', text)
-    values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', text)]
-    if len(values) >= expected_n and len(compact) <= expected_n * 2 + 10:
+    source = text[idx:] if idx != -1 else text
+    values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', source)]
+    if len(values) >= expected_n:
         return values[:expected_n]
-
-    raise ValueError(f"Could not recover {expected_n} scores from incomplete output: {text[:250]}")
+    raise ValueError(f"Expected {expected_n} scores, got {len(values)}.")
 
 
 def parse_scores_json(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
-    """Parse target-model questionnaire scores robustly.
-
-    Preferred output is either {"scores": [...]} or a raw JSON array.
-    Also accepts item-number keyed objects such as {"181": 5, "182": 4}.
-    If a model returns too many pure score values, the parser takes the first
-    expected_n values rather than failing the whole case. This is mainly for
-    Google/Gemma models that sometimes append extra score-like values after
-    the requested JSON.
-    """
+    """Parse target scores from score-only model output."""
     try:
         snippet = extract_json_candidate(raw_text)
         parsed = json.loads(snippet)
     except Exception:
-        return parse_scores_from_incomplete_text(raw_text, expected_n, item_numbers=item_numbers)
+        return parse_scores_from_text_fallback(raw_text, expected_n, item_numbers=item_numbers)
 
-    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else None
-
+    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else []
     scores = None
 
     if isinstance(parsed, dict):
         raw_scores = parsed.get("scores")
-
         if isinstance(raw_scores, list):
             scores = raw_scores
-
-        if scores is None:
+        else:
             numeric_items = []
             for key, value in parsed.items():
-                key_text = str(key).strip()
-                if key_text.isdigit():
-                    numeric_items.append((int(key_text), value))
-
+                if str(key).strip().isdigit():
+                    numeric_items.append((int(str(key).strip()), value))
             if requested_items:
                 by_key = {k: v for k, v in numeric_items}
                 if all(item in by_key for item in requested_items):
                     scores = [by_key[item] for item in requested_items]
-
             if scores is None and numeric_items:
                 numeric_items.sort(key=lambda kv: kv[0])
-                if len(numeric_items) >= expected_n:
-                    scores = [value for _, value in numeric_items[:expected_n]]
-
+                scores = [v for _, v in numeric_items]
     elif isinstance(parsed, list):
         scores = parsed
     else:
         raise ValueError("JSON output must be a scores object, item-keyed object, or array.")
 
     if not isinstance(scores, list):
-        raise ValueError(f"JSON output missing scores list or item-number keyed scores: {str(parsed)[:250]}")
+        return parse_scores_from_text_fallback(raw_text, expected_n, item_numbers=item_numbers)
 
-    # If the model returned more score values than requested, keep only the ordered
-    # requested scores. This prevents long Google/Gemma calls from being discarded
-    # when the model appends accidental extra values after the valid answer.
     if len(scores) > expected_n:
         scores = scores[:expected_n]
-
     if len(scores) != expected_n:
         raise ValueError(f"Expected {expected_n} scores, got {len(scores)}.")
 
@@ -1597,8 +1473,6 @@ def call_model_text(
             logger.info(f"    raw text cache hit: {purpose} | {spec.key}")
             return cached
 
-    groq_oversize_tried_keys: set[str] = set()
-
     for attempt in range(8):
         try:
             if spec.provider == "openai_responses":
@@ -1609,8 +1483,6 @@ def call_model_text(
                 text = call_groq_chat(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
             elif spec.provider == "google_genai":
                 text = call_google_genai(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
-            elif spec.provider == "google_live":
-                text = asyncio.run(call_google_live_text(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores))
             else:
                 raise RuntimeError(f"Unsupported provider: {spec.provider}")
 
@@ -1620,29 +1492,6 @@ def call_model_text(
             return text
 
         except Exception as e:
-            if spec.provider == "groq_chat" and is_groq_single_request_too_large(e):
-                failed_key = current_groq_key_name()
-                groq_oversize_tried_keys.add(failed_key)
-                if len(groq_oversize_tried_keys) < len(GROQ_API_KEY_ENTRIES):
-                    switched = rotate_groq_key(
-                        logger,
-                        reason=f"single Groq request too large on {failed_key} during {purpose}",
-                    )
-                    if switched:
-                        logger.warning(
-                            f"    retry {attempt + 1} for {purpose} | {spec.key}: {failed_key} rejected the single request; "
-                            f"trying {current_groq_key_name()} immediately without 60s sleep"
-                        )
-                        time.sleep(0.25)
-                        continue
-                raise RuntimeError(
-                    f"Groq rejected this single request as larger than the TPM/request limit for all tried keys "
-                    f"({', '.join(sorted(groq_oversize_tried_keys))}). Waiting will not fix this. "
-                    f"For exact Prompt Type 2 with Llama as instructor, use a Groq key/org with a higher TPM limit, "
-                    f"lower GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS, switch to Prompt Type 1/3, or use GPT/Gemini as instructor. "
-                    f"Original error: {repr(e)}"
-                ) from e
-
             if spec.provider == "groq_chat" and should_rotate_groq_key(e):
                 hint = retry_hint_seconds(e)
                 switched = rotate_groq_key(
@@ -1660,16 +1509,6 @@ def call_model_text(
                         )
                     time.sleep(1.0)
                     continue
-
-            if is_realtime_empty_output_error(e):
-                # This is usually a transient Realtime API completion issue, not a bad score.
-                # Retry the same target batch; do not fail the whole case immediately.
-                delay = min(2.0 + attempt * 1.5, 10.0) + random.uniform(0, 0.5)
-                logger.warning(
-                    f"    retry {attempt + 1} for {purpose} | {spec.key} after empty Realtime output | waiting {delay:.1f}s"
-                )
-                time.sleep(delay)
-                continue
 
             if is_rate_limit_error(e) or is_temporary_server_error(e):
                 delay = compute_retry_delay(e, attempt)
@@ -1859,23 +1698,37 @@ def call_google_genai(
     from google.genai import types
 
     if expected_scores is not None:
-        # Google/Gemini sometimes truncates or malforms JSON arrays when response_mime_type=application/json
-        # is used with a very long system/personality prompt. For score-only target batches, plain CSV
-        # is more reliable and still contains ONLY numeric scores. The local parser validates count/order.
-        prompt = (
-            f"{user_prompt}\n\n"
-            "IMPORTANT OUTPUT FORMAT OVERRIDE FOR THIS API CALL:\n"
-            f"Return exactly {expected_scores} numeric scores and nothing else.\n"
-            "Use this exact plain format: 3,4,1,5,2\n"
-            "Do NOT return JSON. Do NOT include brackets. Do NOT include item numbers. "
-            "Do NOT include item text. Do NOT include explanations, markdown, bullets, or labels.\n"
-            f"There must be exactly {expected_scores} integers, each from 1 to 5, in the same order as the items above."
-        )
-        config = types.GenerateContentConfig(
-            temperature=0,
-            max_output_tokens=max(max_tokens, expected_scores * 16 + 256),
-            system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
-        )
+        # Gemini/Gemma target scoring is more reliable as plain score text than JSON mode.
+        # JSON MIME mode caused Gemini 3 Flash to repeatedly stop after about 8 scores.
+        score_format = GOOGLE_TARGET_SCORE_FORMAT
+        if score_format in {"json", "json_object", "json_array"}:
+            prompt = (
+                f"{user_prompt}\n\n"
+                f"Return only the answer scores for the requested items. "
+                f"Use this exact JSON shape: {{\"scores\": [integer, integer, ...]}} with exactly {expected_scores} integers from 1 to 5. "
+                f"Do not include item text, item numbers, explanations, markdown, comments, or any extra values."
+            )
+            config = types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=max_tokens,
+                system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+                response_mime_type="application/json",
+            )
+        else:
+            prompt = (
+                f"{user_prompt}\n\n"
+                "IMPORTANT OUTPUT OVERRIDE FOR THIS CALL:\n"
+                f"Ignore any earlier instruction that asks for JSON or brackets. Return exactly {expected_scores} scores only.\n"
+                "Format: plain comma-separated integers only, e.g. 4,2,5,3.\n"
+                "Each value must be an integer from 1 to 5.\n"
+                "Do not include item numbers, item text, labels, explanations, markdown, JSON, brackets, quotes, comments, or extra values.\n"
+                f"Your final answer must contain exactly {expected_scores} comma-separated integers and nothing else."
+            )
+            config = types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=max_tokens,
+                system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+            )
     else:
         prompt = user_prompt
         config = types.GenerateContentConfig(
@@ -1884,13 +1737,44 @@ def call_google_genai(
             system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
         )
 
-    reserve_google_rpm_capacity(logger, purpose)
+    if spec.model_id.lower().startswith("gemini-3") and GOOGLE_THINKING_LEVEL not in {"", "none", "off", "disabled"}:
+        try:
+            # Rebuild config explicitly because google-genai config objects vary by SDK version.
+            cfg_kwargs = {
+                "temperature": 0,
+                "max_output_tokens": max_tokens,
+                "system_instruction": (system_prompt if system_prompt and system_prompt.strip() else None),
+            }
+            if expected_scores is not None and GOOGLE_TARGET_SCORE_FORMAT in {"json", "json_object", "json_array"}:
+                cfg_kwargs["response_mime_type"] = "application/json"
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=GOOGLE_THINKING_LEVEL)
+            config = types.GenerateContentConfig(**cfg_kwargs)
+        except Exception:
+            pass
 
-    response = client.models.generate_content(
-        model=spec.model_id,
-        contents=prompt,
-        config=config,
-    )
+    try:
+        response = client.models.generate_content(
+            model=spec.model_id,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as e:
+        # Some Google model/server combinations may reject response_schema.
+        # Retry with JSON MIME type only and let our parser validate the result.
+        if expected_scores is not None and GOOGLE_TARGET_SCORE_FORMAT in {"json", "json_object", "json_array"} and "schema" in str(e).lower():
+            fallback_config = types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=max_tokens,
+                system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+                response_mime_type="application/json",
+            )
+            response = client.models.generate_content(
+                model=spec.model_id,
+                contents=prompt,
+                config=fallback_config,
+            )
+        else:
+            raise
 
     text = getattr(response, "text", None)
     if not text:
@@ -1910,105 +1794,6 @@ def call_google_genai(
         raise RuntimeError("Google AI Studio / Gemini API returned empty text.")
     return text.strip()
 
-
-
-
-async def call_google_live_text(
-    spec: ModelSpec,
-    system_prompt: str,
-    user_prompt: str,
-    logger: logging.Logger,
-    purpose: str,
-    max_tokens: int,
-    expected_scores: Optional[int],
-) -> str:
-    """Call Gemini 3.1 Flash Live Preview through the Gemini Live API in TEXT mode.
-
-    The Live model is not a normal generate_content model. Google documents it as
-    a WebSocket Live API model, so this function opens one short-lived text-only
-    Live session per validation call, sends the full prompt as one turn, collects
-    text chunks, then closes the session.
-
-    For validation, this is usable as an experimental comparison model, but it is
-    generally less efficient than Gemini Flash/Flash-Lite for batch questionnaire scoring.
-    """
-    client = get_google_genai_client()
-    from google.genai import types
-
-    if expected_scores is not None:
-        user_prompt = (
-            f"{user_prompt}\n\n"
-            f"Return only score values for the requested items. "
-            f"Preferred format: {{\"scores\": [integer, integer, ...]}} with exactly {expected_scores} integers from 1 to 5. "
-            f"Do not include item text, item numbers, explanations, markdown, or comments."
-        )
-
-    if system_prompt and system_prompt.strip():
-        full_prompt = (
-            "SYSTEM INSTRUCTIONS FOR THIS VALIDATION CASE:\n"
-            f"{system_prompt}\n\n"
-            "USER REQUEST:\n"
-            f"{user_prompt}"
-        )
-    else:
-        full_prompt = user_prompt
-
-    # Live API uses a WebSocket session. Keep the same local throttle bucket as
-    # other Google calls so the runner does not exceed project RPM when many
-    # cases are run in sequence.
-    reserve_google_rpm_capacity(logger, purpose)
-
-    async def _run_live_request() -> str:
-        chunks: List[str] = []
-        config = {"response_modalities": ["TEXT"]}
-
-        async with client.aio.live.connect(model=spec.model_id, config=config) as session:
-            await session.send_client_content(
-                turns=types.Content(
-                    role="user",
-                    parts=[types.Part(text=full_prompt)],
-                ),
-                turn_complete=True,
-            )
-
-            async for msg in session.receive():
-                direct_text = getattr(msg, "text", None)
-                if direct_text:
-                    chunks.append(str(direct_text))
-
-                server_content = getattr(msg, "server_content", None)
-                if server_content is not None:
-                    output_transcription = getattr(server_content, "output_transcription", None)
-                    if output_transcription is not None:
-                        transcript_text = getattr(output_transcription, "text", None)
-                        if transcript_text:
-                            chunks.append(str(transcript_text))
-
-                    model_turn = getattr(server_content, "model_turn", None)
-                    if model_turn is not None:
-                        for part in getattr(model_turn, "parts", []) or []:
-                            part_text = getattr(part, "text", None)
-                            if part_text:
-                                chunks.append(str(part_text))
-
-                    if getattr(server_content, "turn_complete", False):
-                        break
-
-                if getattr(msg, "turn_complete", False):
-                    break
-
-        return "".join(chunks).strip()
-
-    try:
-        text = await asyncio.wait_for(_run_live_request(), timeout=GOOGLE_LIVE_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError as e:
-        raise RuntimeError(
-            f"Gemini Live API timed out after {GOOGLE_LIVE_TIMEOUT_SECONDS:.1f}s during {purpose}."
-        ) from e
-
-    if not text:
-        raise RuntimeError("Gemini Live API returned empty text.")
-    return text.strip()
 
 # =============================================================================
 # Scoring and prompt building
@@ -2371,8 +2156,56 @@ def build_instructor_system_prompt(prompt_type: str = "1") -> str:
     )
 
 
+def participant_profile_fingerprint(row: pd.Series) -> str:
+    """Stable fingerprint of the participant's 300 raw item responses.
+
+    This lets the durable instructor cache survive script version changes while
+    still invalidating if the participant data changes.
+    """
+    payload = {f"i{n}": normalize_raw_score(row.get(f"i{n}", 3)) for n in range(1, 301)}
+    return stable_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def durable_instructor_cache_key(
+    row: pd.Series,
+    instructor_key: str,
+    prompt_type: str,
+    questionnaire_mode: str,
+    spec: ModelSpec,
+) -> str:
+    """Cache key for instructor prompts that can be reused across targets/runs.
+
+    The instructor prompt depends on the participant profile, instructor model,
+    prompt type, and questionnaire split. It does NOT depend on the target model,
+    so this cache saves money when comparing many target models with the same
+    instructor setup.
+
+    Required reuse unit:
+        case + instructor model + prompt type + questionnaire mode
+
+    The participant-profile fingerprint is also included so a cache entry is
+    invalidated automatically if the underlying CSV/personality responses change
+    while the case label stays the same.
+    """
+    qmode = str(questionnaire_mode).strip()
+    if qmode not in {"120-180", "180-120"}:
+        qmode = str(QUESTIONNAIRE_MODE)
+    return stable_hash(json.dumps({
+        "cache_kind": "durable_instructor_prompt_v2_with_questionnaire_mode",
+        "case": str(row.get("case", "unknown")),
+        "profile_fingerprint": participant_profile_fingerprint(row),
+        "instructor_key": instructor_key,
+        "provider": spec.provider,
+        "model_id": spec.model_id,
+        "prompt_type": str(prompt_type),
+        "questionnaire_mode": qmode,
+        "questionnaire_key": "ipip_neo_300_embedded_key_v1",
+    }, ensure_ascii=False, sort_keys=True))
+
+
 def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logging.Logger, prompt_type: str = "1") -> str:
     spec = AVAILABLE_MODELS[instructor_key]
+    questionnaire_mode = str(QUESTIONNAIRE_MODE)
     # Groq on-demand accounts can have small TPM limits even for 128k-context models.
     # Use compact aggregate evidence for Groq/Llama so the instructor call does not exceed TPM.
     # Other providers may use detailed item-level evidence unless FORCE_COMPACT_INSTRUCTOR=1.
@@ -2385,39 +2218,49 @@ def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logg
     cache_key = stable_hash(json.dumps({
         "prompt_version": PROMPT_VERSION,
         "prompt_type": str(prompt_type),
+        "questionnaire_mode": questionnaire_mode,
         "role": "instructor",
         "case": case_id,
         "model_key": instructor_key,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
     }, ensure_ascii=False, sort_keys=True))
+    durable_key = durable_instructor_cache_key(row, instructor_key, str(prompt_type), questionnaire_mode, spec)
 
+    # First check the normal versioned cache. Then check the durable cache, which
+    # survives script-version changes and is shared across target-model combinations.
     cached = INSTRUCTOR_CACHE.get(cache_key)
     if cached is not None:
-        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key} | prompt_type={prompt_type}")
+        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key} | prompt_type={prompt_type} | qmode={questionnaire_mode}")
+        if durable_key not in DURABLE_INSTRUCTOR_CACHE:
+            DURABLE_INSTRUCTOR_CACHE[durable_key] = cached
+            save_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE, DURABLE_INSTRUCTOR_CACHE)
         return cached
 
-    instructor_max_tokens = DEFAULT_INSTRUCTOR_MAX_TOKENS
-    if str(prompt_type) == "2" and spec.provider == "groq_chat":
-        # The pasted FPS script used max_tokens=400 for the Llama narrative.
-        # Using the normal 1800-token validation default makes the requested TPM much larger.
-        instructor_max_tokens = GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS
+    durable_cached = DURABLE_INSTRUCTOR_CACHE.get(durable_key)
+    if durable_cached is not None:
+        logger.info(
+            f"    durable instructor cache hit | case {case_id} | {instructor_key} | "
+            f"prompt_type={prompt_type} | qmode={questionnaire_mode} | reused across targets/runs"
+        )
+        INSTRUCTOR_CACHE[cache_key] = durable_cached
+        save_json_cache(INSTRUCTOR_CACHE_FILE, INSTRUCTOR_CACHE)
+        return durable_cached
 
-    logger.info(
-        f"    generating instructor prompt | case {case_id} | {instructor_key} | prompt_type={prompt_type} | "
-        f"compact={compact} | chars={len(system_prompt) + len(user_prompt)} | max_tokens={instructor_max_tokens}"
-    )
+    logger.info(f"    generating instructor prompt | case {case_id} | {instructor_key} | prompt_type={prompt_type} | qmode={questionnaire_mode} | compact={compact} | chars={len(system_prompt) + len(user_prompt)}")
     text = call_model_text(
         spec=spec,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         logger=logger,
         purpose=f"instructor_prompt_case_{case_id}_ptype_{prompt_type}",
-        max_tokens=instructor_max_tokens,
+        max_tokens=DEFAULT_INSTRUCTOR_MAX_TOKENS,
         expected_scores=None,
     )
     INSTRUCTOR_CACHE[cache_key] = text
+    DURABLE_INSTRUCTOR_CACHE[durable_key] = text
     save_json_cache(INSTRUCTOR_CACHE_FILE, INSTRUCTOR_CACHE)
+    save_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE, DURABLE_INSTRUCTOR_CACHE)
     return text
 
 def build_training_calibration(row: pd.Series) -> str:
@@ -2539,7 +2382,7 @@ def build_validation_system_prompt(
             "You are to answer as the person whose personality is represented by the information below.\n\n"
 
             "Treat the narrative profile as a high-level description of your own enduring personality. "
-            f"Treat the labeled examples from {TRAIN_RANGE_LABEL} as concrete evidence of how you, in this temporary adopted personality, "
+            "Treat the labeled examples from items 1-120 as concrete evidence of how you, in this temporary adopted personality, "
             "typically respond to questionnaire statements.\n\n"
 
             "When answering later items:\n"
@@ -2553,7 +2396,7 @@ def build_validation_system_prompt(
 
             "--- PERSONALITY NARRATIVE FROM THE 300-ITEM PROFILE ---\n"
             f"{instructor_prompt}\n\n"
-            f"--- LABELED REFERENCE ITEMS ({TRAIN_RANGE_LABEL}) FOR THIS SAME ADOPTED PERSONA ---\n"
+            "--- LABELED REFERENCE ITEMS (1-120) FOR THIS SAME ADOPTED PERSONA ---\n"
             f"{few_shot_prompt}"
         )
     else:
@@ -2608,7 +2451,7 @@ def build_target_batch_instruction(item_numbers: Sequence[int], prompt_type: str
             "4 = Moderately Accurate\n"
             "5 = Very Accurate\n\n"
             f"Return ONLY a JSON array of EXACTLY {n} integers, one per statement in order. "
-            "Do NOT repeat item numbers or item text. No explanation, no prose, no markdown.\n\n"
+            "No explanation, no prose, no markdown.\n\n"
             f"{numbered}"
         )
 
@@ -2630,6 +2473,7 @@ def build_target_batch_instruction(item_numbers: Sequence[int], prompt_type: str
     )
 
 
+
 def run_target_batches(
     row: pd.Series,
     system_prompt: str,
@@ -2643,35 +2487,26 @@ def run_target_batches(
     case_id = str(row.get("case", "unknown"))
 
     effective_batch_size = batch_size
-
-    if spec.provider == "groq_chat":
-        effective_batch_size = max(1, min(batch_size, LLAMA_TARGET_BATCH_SIZE))
-        if effective_batch_size != batch_size:
-            logger.info(
-                f"    Llama/Groq target batch override: using {effective_batch_size} items per call "
-                f"instead of {batch_size}. Set LLAMA_TARGET_BATCH_SIZE in .env to change this."
-            )
-
-    elif spec.provider in {"google_genai", "google_live"}:
+    if spec.provider == "google_genai":
         model_id_lower = spec.model_id.lower()
-        if model_id_lower.startswith("gemma"):
-            # Gemma-as-target was slow and unreliable as one huge 120/180-item request.
-            # Use smaller chunks, but run them concurrently to reduce wall-clock time.
+        if model_id_lower.startswith("gemini-3"):
+            effective_batch_size = max(1, min(GEMINI3_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
+            logger.info(
+                f"    Gemini 3 target batch size: using {effective_batch_size} items per call "
+                f"instead of {batch_size}. Set GEMINI3_TARGET_BATCH_SIZE in .env to change this."
+            )
+        elif model_id_lower.startswith("gemma"):
             effective_batch_size = max(1, min(GEMMA_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
-            if effective_batch_size != batch_size:
-                logger.info(
-                    f"    Gemma target batch override: using {effective_batch_size} items per call "
-                    f"instead of {batch_size}, parallel={GOOGLE_TARGET_PARALLEL}, workers={GOOGLE_TARGET_MAX_WORKERS}. "
-                    f"Set GEMMA_TARGET_BATCH_SIZE / GOOGLE_TARGET_PARALLEL in .env to change this."
-                )
+            logger.info(
+                f"    Gemma target batch size: using {effective_batch_size} items per call "
+                f"instead of {batch_size}. Set GEMMA_TARGET_BATCH_SIZE in .env to change this."
+            )
         else:
-            # Gemini Flash / Flash-Lite is fast, but score-only CSV batches are most reliable in smaller chunks.
-            effective_batch_size = max(1, min(GEMINI_FLASH_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
-            if effective_batch_size != batch_size:
-                logger.info(
-                    f"    Gemini target batch override: using {effective_batch_size} items per call "
-                    f"instead of {batch_size}. Set GEMINI_FLASH_TARGET_BATCH_SIZE in .env to change this."
-                )
+            effective_batch_size = max(1, min(GEMINI_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
+            logger.info(
+                f"    Gemini target batch size: using {effective_batch_size} items per call "
+                f"instead of {batch_size}. Set GEMINI_TARGET_BATCH_SIZE in .env to change this."
+            )
 
     batch_groups: List[List[int]] = [
         TEST_ITEMS[start:start + effective_batch_size]
@@ -2702,8 +2537,8 @@ def run_target_batches(
             return int(item_numbers[0]), list(cached)
 
         logger.info(f"    target answering {batch_label} | {target_key}")
-        last_parse_error: Optional[Exception] = None
         scores: Optional[List[int]] = None
+        last_parse_error: Optional[Exception] = None
         for parse_attempt in range(TARGET_PARSE_RETRIES + 1):
             raw = call_model_text(
                 spec=spec,
@@ -2714,10 +2549,10 @@ def run_target_batches(
                 max_tokens=(
                     DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
                     if spec.provider.startswith("openai")
-                    else min(DEFAULT_GROQ_MAX_TOKENS, max(96, expected_n * 6))
+                    else min(DEFAULT_GROQ_MAX_TOKENS, max(128, expected_n * 8 + 64))
                     if spec.provider == "groq_chat"
-                    else min(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, max(512, expected_n * 12 + 256))
-                    if spec.provider in {"google_genai", "google_live"}
+                    else min(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, max(2048, expected_n * 32 + 512))
+                    if spec.provider == "google_genai"
                     else DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
                 ),
                 expected_scores=expected_n,
@@ -2735,9 +2570,9 @@ def run_target_batches(
                     time.sleep(delay)
                     continue
                 raise
+
         if scores is None:
             raise RuntimeError(f"Target batch parsing failed: {repr(last_parse_error)}")
-
         TARGET_BATCH_CACHE[cache_key] = scores
         save_json_cache(TARGET_BATCH_CACHE_FILE, TARGET_BATCH_CACHE)
         return int(item_numbers[0]), scores
@@ -2747,10 +2582,16 @@ def run_target_batches(
             return run_one_batch(item_numbers)
         except Exception as e:
             can_split = (
-                spec.provider in {"google_genai", "google_live"}
+                spec.provider == "google_genai"
                 and GOOGLE_ADAPTIVE_BATCH_SPLIT
                 and len(item_numbers) > GOOGLE_MIN_TARGET_BATCH_SIZE
-                and (isinstance(e, ValueError) or "parse" in str(e).lower() or "recover" in str(e).lower() or "expected" in str(e).lower())
+                and (
+                    isinstance(e, ValueError)
+                    or "expected" in str(e).lower()
+                    or "scores" in str(e).lower()
+                    or "parse" in str(e).lower()
+                    or "recover" in str(e).lower()
+                )
             )
             if not can_split:
                 raise
@@ -2765,43 +2606,16 @@ def run_target_batches(
             _, right_scores = run_one_batch_adaptive(right)
             return left_start, left_scores + right_scores
 
-    # Parallel Google/Gemma target mode: this is the main fix for Gemma target slowness.
-    # It avoids one huge unstable call and avoids serially waiting for 4 separate calls.
-    if (
-        spec.provider in {"google_genai", "google_live"}
-        and spec.model_id.lower().startswith("gemma")
-        and GOOGLE_TARGET_PARALLEL
-        and len(batch_groups) > 1
-    ):
-        logger.info(
-            f"    Running Gemma target batches in parallel: {len(batch_groups)} batches, "
-            f"max_workers={min(GOOGLE_TARGET_MAX_WORKERS, len(batch_groups))}"
-        )
-        results_by_start: Dict[int, List[int]] = {}
-        with ThreadPoolExecutor(max_workers=min(GOOGLE_TARGET_MAX_WORKERS, len(batch_groups))) as executor:
-            future_map = {executor.submit(run_one_batch_adaptive, group): int(group[0]) for group in batch_groups}
-            for future in as_completed(future_map):
-                start_item = future_map[future]
-                try:
-                    batch_start, batch_scores = future.result()
-                    results_by_start[batch_start] = batch_scores
-                except Exception as e:
-                    raise RuntimeError(f"Gemma parallel target batch starting at item {start_item} failed: {repr(e)}") from e
-
-        all_scores: List[int] = []
-        for start_item in sorted(results_by_start):
-            all_scores.extend(results_by_start[start_item])
-
-    else:
-        all_scores = []
-        for item_numbers in batch_groups:
-            _, scores = run_one_batch_adaptive(item_numbers)
-            all_scores.extend(scores)
-            time.sleep(0.25)
+    all_scores: List[int] = []
+    for item_numbers in batch_groups:
+        _, scores = run_one_batch_adaptive(item_numbers)
+        all_scores.extend(scores)
+        time.sleep(0.25)
 
     if len(all_scores) != len(TEST_ITEMS):
         raise RuntimeError(f"Target returned {len(all_scores)} total test scores, expected {len(TEST_ITEMS)}.")
     return all_scores
+
 
 # =============================================================================
 # Metrics
@@ -3725,24 +3539,63 @@ def expected_result_keys(df: pd.DataFrame, selection: Dict[str, List[str]]) -> s
 # =============================================================================
 
 def find_default_csv() -> Path:
-    candidates = [
-        SCRIPT_DIR / "IPIP_NEO_300.csv",
-        SCRIPT_DIR / "prosocial_antisocial_ipip300_answers.csv",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
+    """Return the only allowed validation dataset path.
+
+    This runner is locked to selected_50_raw_IPIP_NEO_300_items.csv.
+    It must sit beside this script unless the same filename is provided with --csv.
+    No fallback dataset is allowed.
+    """
+    if REQUIRED_DATASET_PATH.exists():
+        return REQUIRED_DATASET_PATH
     raise FileNotFoundError(
-        "Could not find IPIP_NEO_300.csv or prosocial_antisocial_ipip300_answers.csv beside the script. "
-        "Use --csv to provide a path."
+        f"Required validation dataset not found: {REQUIRED_DATASET_PATH}\n"
+        f"Place {REQUIRED_DATASET_NAME} in the same folder as this script. "
+        "No fallback CSV/Excel dataset will be used."
     )
+
+def _read_excel_validation_data(path: Path) -> pd.DataFrame:
+    """Read an Excel workbook and choose the sheet containing i1-i300 columns when possible."""
+    workbook = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    if not workbook:
+        raise ValueError(f"Excel workbook has no readable sheets: {path}")
+
+    # Prefer the first sheet that contains all questionnaire columns. This lets the
+    # balanced-selection workbook safely include summary/detail sheets.
+    for sheet_name, sheet_df in workbook.items():
+        if all(col in sheet_df.columns for col in ALL_COLS):
+            return sheet_df
+
+    # Fallback to the first sheet, then let the missing-column check below give
+    # a clear error listing the missing i1-i300 columns.
+    first_sheet_name = next(iter(workbook))
+    return workbook[first_sheet_name]
 
 
 def load_data(csv_path: Path, max_participants: Optional[int]) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+    csv_path = Path(csv_path).expanduser().resolve()
+    if csv_path.name != REQUIRED_DATASET_NAME:
+        raise RuntimeError(
+            f"This validation runner is locked to {REQUIRED_DATASET_NAME}. "
+            f"Refusing to load: {csv_path.name}"
+        )
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Required validation dataset not found: {csv_path}. "
+            f"Place {REQUIRED_DATASET_NAME} beside this script."
+        )
+    suffix = csv_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        df = _read_excel_validation_data(csv_path)
+    else:
+        df = pd.read_csv(csv_path)
+
     if "case" not in df.columns:
         if "profile_name" in df.columns:
             df = df.rename(columns={"profile_name": "case"})
+        elif "participant_id" in df.columns:
+            df = df.rename(columns={"participant_id": "case"})
+        elif "Participant" in df.columns:
+            df = df.rename(columns={"Participant": "case"})
         else:
             df["case"] = [str(i + 1) for i in range(len(df))]
     for optional in ["age", "sex", "country"]:
@@ -3752,7 +3605,10 @@ def load_data(csv_path: Path, max_participants: Optional[int]) -> pd.DataFrame:
 
     missing_cols = [col for col in ALL_COLS if col not in df.columns]
     if missing_cols:
-        raise ValueError(f"CSV is missing required item columns: {missing_cols[:10]} ... total={len(missing_cols)}")
+        raise ValueError(
+            f"Dataset {csv_path.name} is missing required item columns: "
+            f"{missing_cols[:10]} ... total={len(missing_cols)}"
+        )
 
     if max_participants is not None:
         df = df.head(max_participants)
@@ -3811,7 +3667,7 @@ def process_case_pair(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run multi-model IPIP-NEO-300 validation.")
-    parser.add_argument("--csv", type=str, default=None, help="Path to IPIP_NEO_300.csv or equivalent.")
+    parser.add_argument("--csv", type=str, default=None, help="Path to validation dataset. Must be selected_50_raw_IPIP_NEO_300_items.csv. No fallback datasets are allowed.")
     parser.add_argument("--max-participants", type=str, default=None, help="Number of participants, or 'all'. If omitted, asks interactively.")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Target item batch size. Default: 30.")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory. Default: validation_outputs/run_TIMESTAMP")
@@ -3846,7 +3702,6 @@ def main() -> None:
     manifest = load_json_file(output_dir / RUN_MANIFEST_FILENAME) if resume_previous else None
 
     # Configure the selected questionnaire split before data loading and processing.
-    # Prompt Type 2 now also respects this split; for 180-120 it uses the same FPS wording adapted to the selected item range.
     configure_questionnaire_split(str(selection.get("questionnaire_mode", "120-180")))
 
     validate_environment(selection)
@@ -3855,8 +3710,13 @@ def main() -> None:
         max_participants = manifest.get("max_participants", DEFAULT_MAX_PARTICIPANTS)
         batch_size = int(manifest.get("batch_size", args.batch_size))
         case_plots = bool(manifest.get("case_plots", args.case_plots))
-        csv_path = Path(manifest.get("csv_path")).expanduser().resolve() if manifest.get("csv_path") else (Path(args.csv).expanduser().resolve() if args.csv else find_default_csv())
-        logger.info("Resume mode: using previous CSV, participant count, batch size, and model selection.")
+        csv_path = Path(args.csv).expanduser().resolve() if args.csv else find_default_csv()
+        if csv_path.name != REQUIRED_DATASET_NAME:
+            raise RuntimeError(
+                f"This validation runner is locked to {REQUIRED_DATASET_NAME}. "
+                f"Resume manifest/--csv tried to use: {csv_path.name}"
+            )
+        logger.info("Resume mode: using previous participant count, batch size, and model selection; dataset forced to selected_50_raw_IPIP_NEO_300_items.csv.")
     else:
         if args.max_participants is None:
             max_participants = ask_max_participants(DEFAULT_MAX_PARTICIPANTS)
