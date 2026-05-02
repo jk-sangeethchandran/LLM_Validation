@@ -12,10 +12,10 @@ What it does:
    facet-by-facet personality control prompt.
 4. The target model receives:
       - the instructor-generated personality prompt
-      - calibration statistics from the first 180 items
-      - labelled first-180 item examples
-   Then it answers items 181-300.
-   This v10 split uses items 1-180 as target anchors and items 181-300 as validation items.
+      - calibration statistics from the selected training split
+      - labelled training-item examples
+   Then it answers the selected held-out validation items.
+   Prompt Type 2 uses the FPS prompt path and now allows either questionnaire split: 120-180 or 180-120.
 5. Runs all selected instructor × target combinations.
 6. Caches instructor prompts, system prompts, target batches, and OpenAI prompt-cache hints where supported.
 7. Compares human vs LLM answers after reverse coding both sides for trait-direction metrics.
@@ -28,15 +28,17 @@ Install in the same venv:
 
 Expected files beside this script, unless overridden:
     .env
-    selected_50_raw_IPIP_NEO_300_items.csv
+    IPIP_NEO_300.csv   OR   prosocial_antisocial_ipip300_answers.csv
 
 Relevant .env variables:
     OPENAI_API_KEY=...
+    XAI_API_KEY=...                  # xAI/Grok API key, only needed for Grok models
     GROQ_API_KEY=...                 # Groq key 1, only needed if using llama-3.1-8b-instant
     GROQ_API_KEY_2=...               # optional Groq fallback key
     GROQ_API_KEY_3=...               # optional Groq fallback key
     GROQ_API_KEY_TUD=...             # optional Groq fallback key
     GEMINI_API_KEY=...               # Google AI Studio / Gemini API key, only needed for Gemma
+    XAI_API_KEY=...                  # official xAI env var for Grok models
     GOOGLE_AI_STUDIO_API_KEY=...     # optional alternative env name
     GOOGLE_API_KEY=...               # optional alternative env name
 
@@ -47,10 +49,10 @@ Optional Groq throttling controls:
     GROQ_TOKEN_BUFFER=150
     GROQ_THROTTLE_ENABLED=1
     GROQ_KEY_ROTATE_AFTER_SECONDS=120   # rotate Groq key if retry hint is >= this long
+    GROQ_SKIP_OVERSIZE_SLEEP=1           # do not sleep 60s for single requests above current TPM limit
+    GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS=400  # exact FPS script used max_tokens=400 for Llama narrative
 
-Gemma/Gemini models are called through Google AI Studio / Gemini API using the google-genai SDK.
-Gemini 3 Flash Preview is included as a normal text model using official model ID gemini-3-flash-preview.
-Instructor prompts are also saved in .validation_cache/durable_instructor_prompt_cache.json so the same case + instructor + prompt type + questionnaire split is reused across future target-combo runs.
+Gemma models are called through Google AI Studio / Gemini API using the google-genai SDK.
 """
 
 from __future__ import annotations
@@ -100,13 +102,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_FILE, override=True)
 
-PROMPT_VERSION = "multi_model_validation_v19_gemma_target_batch_override"
+PROMPT_VERSION = "multi_model_validation_v25_llama_target_parser_batchfix"
 SELECTION_FILE = SCRIPT_DIR / ".validation_model_selection.json"
 CACHE_DIR = SCRIPT_DIR / ".validation_cache"
 OUTPUT_ROOT = SCRIPT_DIR / "validation_outputs"
 RESUME_STATE_FILE = OUTPUT_ROOT / "_latest_resume_state.json"
-REQUIRED_DATASET_NAME = "selected_50_raw_IPIP_NEO_300_items.csv"
-REQUIRED_DATASET_PATH = SCRIPT_DIR / REQUIRED_DATASET_NAME
 PARTIAL_RESULTS_FILENAME = "partial_results.jsonl"
 RUN_MANIFEST_FILENAME = "run_manifest.json"
 CUMULATIVE_COMPARISON_CSV = OUTPUT_ROOT / "combo_summary_cumulative.csv"
@@ -115,26 +115,14 @@ OUTPUT_ROOT.mkdir(exist_ok=True)
 
 DEFAULT_MAX_PARTICIPANTS = 10
 DEFAULT_BATCH_SIZE = 30
+# Llama/Groq as TARGET can exceed the 6000 TPM tier when the persona prompt is long.
+# Smaller target batches keep each single Groq request below the on-demand TPM limit.
+LLAMA_TARGET_BATCH_SIZE = int(os.getenv("LLAMA_TARGET_BATCH_SIZE", "20"))
 DEFAULT_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none").strip() or "none"
 DEFAULT_OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_INSTRUCTOR_MAX_TOKENS = int(os.getenv("INSTRUCTOR_MAX_OUTPUT_TOKENS", "1800"))
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1800"))
-
-# Optional Gemini 3 thinking control. Use "minimal" or "low" for validation target scoring.
-# Set GOOGLE_THINKING_LEVEL=none/off/disabled to omit thinking_config.
-GOOGLE_THINKING_LEVEL = os.getenv("GOOGLE_THINKING_LEVEL", "minimal").strip().lower()
-GOOGLE_TARGET_SCORE_FORMAT = os.getenv("GOOGLE_TARGET_SCORE_FORMAT", "csv").strip().lower()  # csv is more reliable than JSON mode for Gemini target scoring
-
-# Google target batching.
-# Gemini 3 Flash often returns only ~100 scores when asked for 120 in one call.
-# Use smaller batches and adaptively split any batch that returns too few scores.
-GEMINI_TARGET_BATCH_SIZE = int(os.getenv("GEMINI_TARGET_BATCH_SIZE", "30"))
-GEMINI3_TARGET_BATCH_SIZE = int(os.getenv("GEMINI3_TARGET_BATCH_SIZE", os.getenv("GEMINI_TARGET_BATCH_SIZE", "30")))
-GEMMA_TARGET_BATCH_SIZE = int(os.getenv("GEMMA_TARGET_BATCH_SIZE", "30"))
-GOOGLE_ADAPTIVE_BATCH_SPLIT = (os.getenv("GOOGLE_ADAPTIVE_BATCH_SPLIT", "1").strip() != "0")
-GOOGLE_MIN_TARGET_BATCH_SIZE = int(os.getenv("GOOGLE_MIN_TARGET_BATCH_SIZE", "10"))
-TARGET_PARSE_RETRIES = int(os.getenv("TARGET_PARSE_RETRIES", "2"))
 
 # Groq/Llama on-demand tiers often fail because of TPM rather than context length.
 # The defaults below are deliberately conservative for the common 6000 TPM on-demand limit.
@@ -146,8 +134,12 @@ GROQ_MIN_INTERVAL_SECONDS = float(os.getenv("GROQ_MIN_INTERVAL_SECONDS", "1.0"))
 GROQ_EST_CHARS_PER_TOKEN = float(os.getenv("GROQ_EST_CHARS_PER_TOKEN", "4.0"))
 GROQ_TOKEN_BUFFER = int(os.getenv("GROQ_TOKEN_BUFFER", "150"))
 GROQ_KEY_ROTATE_AFTER_SECONDS = float(os.getenv("GROQ_KEY_ROTATE_AFTER_SECONDS", "120"))
+GROQ_SKIP_OVERSIZE_SLEEP = (os.getenv("GROQ_SKIP_OVERSIZE_SLEEP", "1").strip() != "0")
+GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS", "400"))
 
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+XAI_API_KEY = (os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or "").strip()
+XAI_BASE_URL = (os.getenv("XAI_BASE_URL") or "https://api.x.ai/v1").strip()
 
 # Groq key rotation order requested for long daily/quota waits.
 # The runner starts with the first available key and switches at runtime when Groq
@@ -624,21 +616,33 @@ AVAILABLE_MODELS: Dict[str, ModelSpec] = {
         model_id="gemma-4-31b-it",
         notes="Google AI Studio / Gemini API via google-genai",
     ),
-    "gemini-3.1-flash-preview": ModelSpec(
-        key="gemini-3.1-flash-preview",
-        display="Gemini 3 Flash Preview",
+    "gemini-2.5-flash": ModelSpec(
+        key="gemini-2.5-flash",
+        display="Gemini 2.5 Flash",
         provider="google_genai",
-        # Official Gemini API text model ID is gemini-3-flash-preview.
-        # The selection key keeps your requested 3.1 naming in the menu.
-        model_id="gemini-3-flash-preview",
-        notes="Google Gemini API text model; official model ID: gemini-3-flash-preview",
+        model_id="gemini-2.5-flash",
+        notes="Google AI Studio / Gemini API; faster target/instructor option",
     ),
-    "gemini-3.1-flash-lite-preview": ModelSpec(
-        key="gemini-3.1-flash-lite-preview",
-        display="Gemini 3.1 Flash-Lite Preview",
+    "gemini-2.5-flash-lite": ModelSpec(
+        key="gemini-2.5-flash-lite",
+        display="Gemini 2.5 Flash-Lite",
         provider="google_genai",
-        model_id="gemini-3.1-flash-lite-preview",
-        notes="Google Gemini API text model; cost-efficient Gemini 3.1 option",
+        model_id="gemini-2.5-flash-lite",
+        notes="Google AI Studio / Gemini API; fastest/cheapest target option",
+    ),
+    "grok-4.20-reasoning": ModelSpec(
+        key="grok-4.20-reasoning",
+        display="Grok 4.20 Reasoning",
+        provider="xai_responses",
+        model_id="grok-4.20-reasoning",
+        notes="xAI Responses API; official base URL https://api.x.ai/v1",
+    ),
+    "grok-4-1-fast-reasoning": ModelSpec(
+        key="grok-4-1-fast-reasoning",
+        display="Grok 4.1 Fast Reasoning",
+        provider="xai_responses",
+        model_id="grok-4-1-fast-reasoning",
+        notes="xAI Responses API; fast reasoning model",
     ),
     "llama-3.1-8b-instant": ModelSpec(
         key="llama-3.1-8b-instant",
@@ -693,8 +697,8 @@ def model_short_name(model_key: str) -> str:
         "gpt-realtime-1.5": "realtime15",
         "gemma-4-26b-a4b-it": "gemma26b",
         "gemma-4-31b-it": "gemma31b",
-        "gemini-3.1-flash-preview": "gemini3flash",
-        "gemini-3.1-flash-lite-preview": "gemini31lite",
+        "grok-4.20-reasoning": "grok420",
+        "grok-4-1-fast-reasoning": "grok41fast",
         "llama-3.1-8b-instant": "llama31_8b",
     }
     return aliases.get(model_key, slugify(model_key)[:12])
@@ -824,16 +828,11 @@ def save_json_cache(path: Path, data: Dict[str, Any]) -> None:
 
 
 INSTRUCTOR_CACHE_FILE = CACHE_DIR / "instructor_prompt_cache.json"
-# Durable instructor cache is deliberately independent of PROMPT_VERSION.
-# It prevents paying for the same participant + instructor model + prompt type + questionnaire split again
-# when you test the same instructor across different targets or after small script revisions.
-DURABLE_INSTRUCTOR_CACHE_FILE = CACHE_DIR / "durable_instructor_prompt_cache.json"
 SYSTEM_PROMPT_CACHE_FILE = CACHE_DIR / "validation_system_prompt_cache.json"
 TARGET_BATCH_CACHE_FILE = CACHE_DIR / "target_batch_scores_cache.json"
 RAW_TEXT_CACHE_FILE = CACHE_DIR / "raw_text_generation_cache.json"
 
 INSTRUCTOR_CACHE = load_json_cache(INSTRUCTOR_CACHE_FILE)
-DURABLE_INSTRUCTOR_CACHE = load_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE)
 SYSTEM_PROMPT_CACHE = load_json_cache(SYSTEM_PROMPT_CACHE_FILE)
 TARGET_BATCH_CACHE = load_json_cache(TARGET_BATCH_CACHE_FILE)
 RAW_TEXT_CACHE = load_json_cache(RAW_TEXT_CACHE_FILE)
@@ -909,7 +908,7 @@ def parse_model_selection(raw: str) -> List[str]:
 def prompt_type_description(prompt_type: str) -> str:
     pt = str(prompt_type)
     if pt == "2":
-        return "Prompt Type 2 — exact FPS prompt: instructor and target prompts copied from the uploaded FPS validation script"
+        return "Prompt Type 2 — FPS prompt path: instructor and target prompts from the uploaded FPS validation script, adapted to chosen split"
     if pt == "3":
         return "Prompt Type 3 — FPS instructor + original/current target prompt"
     return "Prompt Type 1 — current validation system: direct second-person validation prompt"
@@ -928,8 +927,8 @@ def choose_prompt_type_interactively(selection: Dict[str, Any]) -> Dict[str, Any
     print("\nChoose prompt system:")
     print("  1. Prompt Type 1 — current system")
     print("     Direct second-person validation prompt generated specifically for the target LLM.")
-    print("  2. Prompt Type 2 — exact FPS prompt")
-    print("     Uses the same instructor narrative prompt and target adoption prompt as the uploaded FPS validation script.")
+    print("  2. Prompt Type 2 — FPS prompt path")
+    print("     Uses the same FPS-style instructor narrative prompt and target adoption prompt; for 180-120, item-range wording is adapted.")
     print("  3. Prompt Type 3 — FPS instructor + original target prompt")
     print("     Instructor uses the uploaded FPS-style prompt, but target uses the original/current validation target prompt.")
 
@@ -937,6 +936,7 @@ def choose_prompt_type_interactively(selection: Dict[str, Any]) -> Dict[str, Any
     if raw not in {"1", "2", "3"}:
         raw = current
     selection["prompt_type"] = raw
+
     save_selection(selection)
     print("Using", prompt_type_description(raw))
     return choose_questionnaire_mode_interactively(selection)
@@ -1043,6 +1043,9 @@ def validate_environment(selection: Dict[str, List[str]]) -> None:
     if "openai_responses" in providers or "openai_realtime" in providers:
         if not OPENAI_API_KEY:
             missing.append("OPENAI_API_KEY")
+    if "xai_responses" in providers:
+        if not XAI_API_KEY:
+            missing.append("XAI_API_KEY")
     if "groq_chat" in providers:
         if not GROQ_API_KEY:
             missing.append("GROQ_API_KEY or GROQ_API_KEY_2 or GROQ_API_KEY_3 or GROQ_API_KEY_TUD")
@@ -1055,9 +1058,14 @@ def validate_environment(selection: Dict[str, List[str]]) -> None:
     if "google_genai" in providers:
         print("\nGoogle AI Studio / Gemini API selected for Gemma.")
         print(f"  GEMINI_API_KEY / GOOGLE_AI_STUDIO_API_KEY / GOOGLE_API_KEY = {'set' if GEMINI_API_KEY else 'not set'}\n")
+    if "xai_responses" in providers:
+        print("\nxAI / Grok Responses API selected.")
+        print(f"  XAI_API_KEY = {'set' if XAI_API_KEY else 'not set'}")
+        print(f"  XAI_BASE_URL = {XAI_BASE_URL}\n")
 
 
 _OPENAI_CLIENT = None
+_XAI_CLIENT = None
 _ASYNC_OPENAI_CLIENT = None
 _GROQ_CLIENT = None
 _GROQ_CLIENT_KEY_NAME: Optional[str] = None
@@ -1075,6 +1083,14 @@ def get_openai_client():
         from openai import OpenAI
         _OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY, max_retries=0)
     return _OPENAI_CLIENT
+
+
+def get_xai_client():
+    global _XAI_CLIENT
+    if _XAI_CLIENT is None:
+        from openai import OpenAI
+        _XAI_CLIENT = OpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL, max_retries=0)
+    return _XAI_CLIENT
 
 
 def get_async_openai_client():
@@ -1165,6 +1181,18 @@ def is_temporary_server_error(exc: Exception) -> bool:
     ])
 
 
+def is_realtime_empty_output_error(exc: Exception) -> bool:
+    """OpenAI Realtime can occasionally complete without a text item.
+    Treat it as a transient provider failure and retry the same target batch.
+    """
+    text = str(exc).lower()
+    return (
+        "realtime response completed without text output" in text
+        or "realtime connection closed before response.done" in text
+        or "completed without text output" in text
+    )
+
+
 def safe_get_header(exc: Exception, key: str) -> Optional[str]:
     try:
         response = getattr(exc, "response", None)
@@ -1217,9 +1245,20 @@ def retry_hint_seconds(exc: Exception) -> Optional[float]:
     return _parse_retry_after_seconds_from_text(str(exc))
 
 
+def is_groq_single_request_too_large(exc: Exception) -> bool:
+    """Detect Groq's 413 TPM/request-size error for one oversized request."""
+    text = str(exc).lower()
+    return (
+        ("413" in text and "request too large" in text)
+        or ("requested" in text and "limit" in text and "tokens per minute" in text and "tpm" in text)
+    )
+
+
 def should_rotate_groq_key(exc: Exception) -> bool:
-    if not is_rate_limit_error(exc):
+    if not is_rate_limit_error(exc) and not is_groq_single_request_too_large(exc):
         return False
+    if is_groq_single_request_too_large(exc):
+        return len(GROQ_API_KEY_ENTRIES) > 1
     hint = retry_hint_seconds(exc)
     if hint is None:
         return False
@@ -1260,15 +1299,19 @@ def reserve_groq_tpm_capacity(
     hard_limit = max(1, GROQ_TPM_LIMIT)
     safe_limit = max(1, int(hard_limit * GROQ_TPM_SAFETY))
 
-    # If one request is itself above the safety limit, allow one such request per window,
-    # but warn if it is above the actual account TPM limit.
+    # If one request is itself above the current key/account TPM limit, waiting cannot make
+    # that single request legal on this key. Do not add it to the rolling TPM history and do
+    # not sleep for 60s. Let call_groq_chat try it immediately; on Groq's 413/TPM error,
+    # call_model_text will rotate to the next configured Groq key.
     effective_limit = max(safe_limit, min(estimate, hard_limit))
     if estimate > hard_limit:
         logger.warning(
             f"    Groq request estimate for {purpose} is {estimate} tokens, above GROQ_TPM_LIMIT={hard_limit}. "
-            "Reduce GROQ_MAX_OUTPUT_TOKENS / INSTRUCTOR_MAX_OUTPUT_TOKENS or use compact prompts."
+            "Skipping proactive sleep and trying configured Groq keys immediately. "
+            "If every key has the same TPM limit, this exact Prompt Type 2 Llama request cannot run on Groq on-demand; "
+            "use a higher-limit Groq key, a non-Groq instructor, or Prompt Type 1/3."
         )
-        effective_limit = estimate
+        return estimate
 
     while True:
         with _GROQ_THROTTLE_LOCK:
@@ -1318,64 +1361,38 @@ def extract_json_candidate(text: str) -> str:
     return candidates[0]
 
 
+def parse_scores_json(raw_text: str, expected_n: int) -> List[int]:
+    """Parse target-model questionnaire scores robustly.
 
-def parse_scores_from_text_fallback(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
-    """Recover score-only outputs from JSON-like, CSV-like, or truncated text."""
-    text = raw_text or ""
-    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else []
-
-    if requested_items:
-        pairs = re.findall(r'["\']?([0-9]{1,3})["\']?\s*:\s*([1-5])(?=\D|$)', text)
-        by_key = {int(k): int(v) for k, v in pairs}
-        if all(item in by_key for item in requested_items):
-            return [by_key[item] for item in requested_items]
-
-    lowered = text.lower()
-    idx = lowered.find("scores")
-    source = text[idx:] if idx != -1 else text
-    values = [int(x) for x in re.findall(r'(?<!\d)([1-5])(?!\d)', source)]
-    if len(values) >= expected_n:
-        return values[:expected_n]
-    raise ValueError(f"Expected {expected_n} scores, got {len(values)}.")
-
-
-def parse_scores_json(raw_text: str, expected_n: int, item_numbers: Optional[Sequence[int]] = None) -> List[int]:
-    """Parse target scores from score-only model output."""
-    try:
-        snippet = extract_json_candidate(raw_text)
-        parsed = json.loads(snippet)
-    except Exception:
-        return parse_scores_from_text_fallback(raw_text, expected_n, item_numbers=item_numbers)
-
-    requested_items = [int(x) for x in item_numbers] if item_numbers is not None else []
-    scores = None
+    Preferred output is either {"scores": [...]} or a raw JSON array.
+    Some models, especially Llama/Groq under Prompt Type 2, may instead
+    return a JSON object keyed by item number, e.g. {"181": 5, "182": 4}.
+    This parser accepts that form and sorts numeric keys in ascending order.
+    """
+    snippet = extract_json_candidate(raw_text)
+    parsed = json.loads(snippet)
 
     if isinstance(parsed, dict):
-        raw_scores = parsed.get("scores")
-        if isinstance(raw_scores, list):
-            scores = raw_scores
-        else:
+        scores = parsed.get("scores")
+
+        # Fallback: accept {"181": 5, "182": 4, ...} or {"1": 5, "2": 4, ...}.
+        if scores is None:
             numeric_items = []
             for key, value in parsed.items():
-                if str(key).strip().isdigit():
-                    numeric_items.append((int(str(key).strip()), value))
-            if requested_items:
-                by_key = {k: v for k, v in numeric_items}
-                if all(item in by_key for item in requested_items):
-                    scores = [by_key[item] for item in requested_items]
-            if scores is None and numeric_items:
+                key_text = str(key).strip()
+                if key_text.isdigit():
+                    numeric_items.append((int(key_text), value))
+
+            if len(numeric_items) == expected_n and len(numeric_items) == len(parsed):
                 numeric_items.sort(key=lambda kv: kv[0])
-                scores = [v for _, v in numeric_items]
+                scores = [value for _, value in numeric_items]
     elif isinstance(parsed, list):
         scores = parsed
     else:
         raise ValueError("JSON output must be a scores object, item-keyed object, or array.")
 
     if not isinstance(scores, list):
-        return parse_scores_from_text_fallback(raw_text, expected_n, item_numbers=item_numbers)
-
-    if len(scores) > expected_n:
-        scores = scores[:expected_n]
+        raise ValueError(f"JSON output missing scores list or item-number keyed scores: {str(parsed)[:250]}")
     if len(scores) != expected_n:
         raise ValueError(f"Expected {expected_n} scores, got {len(scores)}.")
 
@@ -1473,10 +1490,14 @@ def call_model_text(
             logger.info(f"    raw text cache hit: {purpose} | {spec.key}")
             return cached
 
+    groq_oversize_tried_keys: set[str] = set()
+
     for attempt in range(8):
         try:
             if spec.provider == "openai_responses":
                 text = call_openai_responses(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
+            elif spec.provider == "xai_responses":
+                text = call_xai_responses(spec, system_prompt, user_prompt, logger, purpose, max_tokens, expected_scores)
             elif spec.provider == "openai_realtime":
                 text = asyncio.run(call_openai_realtime(spec, system_prompt, user_prompt, logger, purpose, max_tokens))
             elif spec.provider == "groq_chat":
@@ -1492,6 +1513,29 @@ def call_model_text(
             return text
 
         except Exception as e:
+            if spec.provider == "groq_chat" and is_groq_single_request_too_large(e):
+                failed_key = current_groq_key_name()
+                groq_oversize_tried_keys.add(failed_key)
+                if len(groq_oversize_tried_keys) < len(GROQ_API_KEY_ENTRIES):
+                    switched = rotate_groq_key(
+                        logger,
+                        reason=f"single Groq request too large on {failed_key} during {purpose}",
+                    )
+                    if switched:
+                        logger.warning(
+                            f"    retry {attempt + 1} for {purpose} | {spec.key}: {failed_key} rejected the single request; "
+                            f"trying {current_groq_key_name()} immediately without 60s sleep"
+                        )
+                        time.sleep(0.25)
+                        continue
+                raise RuntimeError(
+                    f"Groq rejected this single request as larger than the TPM/request limit for all tried keys "
+                    f"({', '.join(sorted(groq_oversize_tried_keys))}). Waiting will not fix this. "
+                    f"For exact Prompt Type 2 with Llama as instructor, use a Groq key/org with a higher TPM limit, "
+                    f"lower GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS, switch to Prompt Type 1/3, or use GPT/Gemini as instructor. "
+                    f"Original error: {repr(e)}"
+                ) from e
+
             if spec.provider == "groq_chat" and should_rotate_groq_key(e):
                 hint = retry_hint_seconds(e)
                 switched = rotate_groq_key(
@@ -1509,6 +1553,16 @@ def call_model_text(
                         )
                     time.sleep(1.0)
                     continue
+
+            if is_realtime_empty_output_error(e):
+                # This is usually a transient Realtime API completion issue, not a bad score.
+                # Retry the same target batch; do not fail the whole case immediately.
+                delay = min(2.0 + attempt * 1.5, 10.0) + random.uniform(0, 0.5)
+                logger.warning(
+                    f"    retry {attempt + 1} for {purpose} | {spec.key} after empty Realtime output | waiting {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
 
             if is_rate_limit_error(e) or is_temporary_server_error(e):
                 delay = compute_retry_delay(e, attempt)
@@ -1564,6 +1618,85 @@ def call_openai_responses(
     return text
 
 
+
+def call_xai_responses(
+    spec: ModelSpec,
+    system_prompt: str,
+    user_prompt: str,
+    logger: logging.Logger,
+    purpose: str,
+    max_tokens: int,
+    expected_scores: Optional[int],
+) -> str:
+    """Call xAI/Grok through the OpenAI-compatible Responses API.
+
+    xAI documents OpenAI REST API compatibility at https://api.x.ai/v1. We use the
+    OpenAI Python client with base_url=XAI_BASE_URL and API key XAI_API_KEY.
+    """
+    client = get_xai_client()
+    input_items = []
+    if system_prompt and system_prompt.strip():
+        input_items.append({
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_text", "text": system_prompt}],
+        })
+    input_items.append({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": user_prompt}],
+    })
+
+    kwargs: Dict[str, Any] = {
+        "model": spec.model_id,
+        "temperature": 0,
+        "max_output_tokens": max_tokens,
+        "input": input_items,
+    }
+
+    # Try structured outputs for score batches. If xAI rejects the schema or
+    # the selected Grok model does not support it, retry once without schema;
+    # the existing local parser will still validate the returned scores.
+    if expected_scores is not None:
+        kwargs["text"] = {"format": build_scores_schema(expected_scores)}
+
+    try:
+        response = client.responses.create(**kwargs)
+    except Exception as e:
+        if expected_scores is not None and any(
+            token in str(e).lower()
+            for token in ["schema", "response_format", "text.format", "unsupported", "invalid"]
+        ):
+            logger.warning(
+                f"    xAI structured-output fallback for {purpose} | {spec.key}: {repr(e)}"
+            )
+            kwargs.pop("text", None)
+            fallback_prompt = (
+                f"{user_prompt}\n\n"
+                "OUTPUT FORMAT OVERRIDE:\n"
+                f"Return exactly {expected_scores} scores only. Use plain comma-separated integers only, e.g. 4,2,5,3.\n"
+                "Do not include item numbers, item text, labels, explanations, markdown, JSON, brackets, quotes, comments, or extra values."
+            )
+            kwargs["input"] = []
+            if system_prompt and system_prompt.strip():
+                kwargs["input"].append({
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                })
+            kwargs["input"].append({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": fallback_prompt}],
+            })
+            response = client.responses.create(**kwargs)
+        else:
+            raise
+
+    text = extract_response_text(response)
+    if not text:
+        raise RuntimeError("xAI Responses API returned empty text.")
+    return text
 async def call_openai_realtime(
     spec: ModelSpec,
     system_prompt: str,
@@ -1698,37 +1831,30 @@ def call_google_genai(
     from google.genai import types
 
     if expected_scores is not None:
-        # Gemini/Gemma target scoring is more reliable as plain score text than JSON mode.
-        # JSON MIME mode caused Gemini 3 Flash to repeatedly stop after about 8 scores.
-        score_format = GOOGLE_TARGET_SCORE_FORMAT
-        if score_format in {"json", "json_object", "json_array"}:
-            prompt = (
-                f"{user_prompt}\n\n"
-                f"Return only the answer scores for the requested items. "
-                f"Use this exact JSON shape: {{\"scores\": [integer, integer, ...]}} with exactly {expected_scores} integers from 1 to 5. "
-                f"Do not include item text, item numbers, explanations, markdown, comments, or any extra values."
-            )
-            config = types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=max_tokens,
-                system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
-                response_mime_type="application/json",
-            )
-        else:
-            prompt = (
-                f"{user_prompt}\n\n"
-                "IMPORTANT OUTPUT OVERRIDE FOR THIS CALL:\n"
-                f"Ignore any earlier instruction that asks for JSON or brackets. Return exactly {expected_scores} scores only.\n"
-                "Format: plain comma-separated integers only, e.g. 4,2,5,3.\n"
-                "Each value must be an integer from 1 to 5.\n"
-                "Do not include item numbers, item text, labels, explanations, markdown, JSON, brackets, quotes, comments, or extra values.\n"
-                f"Your final answer must contain exactly {expected_scores} comma-separated integers and nothing else."
-            )
-            config = types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=max_tokens,
-                system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
-            )
+        prompt = (
+            f"{user_prompt}\n\n"
+            f"Return only valid JSON in this exact shape: "
+            f"{{\"scores\": [integer, integer, ...]}} with exactly {expected_scores} integers from 1 to 5."
+        )
+        config = types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=max_tokens,
+            system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
+            response_mime_type="application/json",
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "scores": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "minItems": expected_scores,
+                        "maxItems": expected_scores,
+                    }
+                },
+                "required": ["scores"],
+                "additionalProperties": False,
+            },
+        )
     else:
         prompt = user_prompt
         config = types.GenerateContentConfig(
@@ -1736,21 +1862,6 @@ def call_google_genai(
             max_output_tokens=max_tokens,
             system_instruction=(system_prompt if system_prompt and system_prompt.strip() else None),
         )
-
-    if spec.model_id.lower().startswith("gemini-3") and GOOGLE_THINKING_LEVEL not in {"", "none", "off", "disabled"}:
-        try:
-            # Rebuild config explicitly because google-genai config objects vary by SDK version.
-            cfg_kwargs = {
-                "temperature": 0,
-                "max_output_tokens": max_tokens,
-                "system_instruction": (system_prompt if system_prompt and system_prompt.strip() else None),
-            }
-            if expected_scores is not None and GOOGLE_TARGET_SCORE_FORMAT in {"json", "json_object", "json_array"}:
-                cfg_kwargs["response_mime_type"] = "application/json"
-            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=GOOGLE_THINKING_LEVEL)
-            config = types.GenerateContentConfig(**cfg_kwargs)
-        except Exception:
-            pass
 
     try:
         response = client.models.generate_content(
@@ -1761,7 +1872,7 @@ def call_google_genai(
     except Exception as e:
         # Some Google model/server combinations may reject response_schema.
         # Retry with JSON MIME type only and let our parser validate the result.
-        if expected_scores is not None and GOOGLE_TARGET_SCORE_FORMAT in {"json", "json_object", "json_array"} and "schema" in str(e).lower():
+        if expected_scores is not None and "schema" in str(e).lower():
             fallback_config = types.GenerateContentConfig(
                 temperature=0,
                 max_output_tokens=max_tokens,
@@ -2156,56 +2267,8 @@ def build_instructor_system_prompt(prompt_type: str = "1") -> str:
     )
 
 
-def participant_profile_fingerprint(row: pd.Series) -> str:
-    """Stable fingerprint of the participant's 300 raw item responses.
-
-    This lets the durable instructor cache survive script version changes while
-    still invalidating if the participant data changes.
-    """
-    payload = {f"i{n}": normalize_raw_score(row.get(f"i{n}", 3)) for n in range(1, 301)}
-    return stable_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-
-
-def durable_instructor_cache_key(
-    row: pd.Series,
-    instructor_key: str,
-    prompt_type: str,
-    questionnaire_mode: str,
-    spec: ModelSpec,
-) -> str:
-    """Cache key for instructor prompts that can be reused across targets/runs.
-
-    The instructor prompt depends on the participant profile, instructor model,
-    prompt type, and questionnaire split. It does NOT depend on the target model,
-    so this cache saves money when comparing many target models with the same
-    instructor setup.
-
-    Required reuse unit:
-        case + instructor model + prompt type + questionnaire mode
-
-    The participant-profile fingerprint is also included so a cache entry is
-    invalidated automatically if the underlying CSV/personality responses change
-    while the case label stays the same.
-    """
-    qmode = str(questionnaire_mode).strip()
-    if qmode not in {"120-180", "180-120"}:
-        qmode = str(QUESTIONNAIRE_MODE)
-    return stable_hash(json.dumps({
-        "cache_kind": "durable_instructor_prompt_v2_with_questionnaire_mode",
-        "case": str(row.get("case", "unknown")),
-        "profile_fingerprint": participant_profile_fingerprint(row),
-        "instructor_key": instructor_key,
-        "provider": spec.provider,
-        "model_id": spec.model_id,
-        "prompt_type": str(prompt_type),
-        "questionnaire_mode": qmode,
-        "questionnaire_key": "ipip_neo_300_embedded_key_v1",
-    }, ensure_ascii=False, sort_keys=True))
-
-
 def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logging.Logger, prompt_type: str = "1") -> str:
     spec = AVAILABLE_MODELS[instructor_key]
-    questionnaire_mode = str(QUESTIONNAIRE_MODE)
     # Groq on-demand accounts can have small TPM limits even for 128k-context models.
     # Use compact aggregate evidence for Groq/Llama so the instructor call does not exceed TPM.
     # Other providers may use detailed item-level evidence unless FORCE_COMPACT_INSTRUCTOR=1.
@@ -2218,49 +2281,39 @@ def generate_instructor_prompt(row: pd.Series, instructor_key: str, logger: logg
     cache_key = stable_hash(json.dumps({
         "prompt_version": PROMPT_VERSION,
         "prompt_type": str(prompt_type),
-        "questionnaire_mode": questionnaire_mode,
         "role": "instructor",
         "case": case_id,
         "model_key": instructor_key,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
     }, ensure_ascii=False, sort_keys=True))
-    durable_key = durable_instructor_cache_key(row, instructor_key, str(prompt_type), questionnaire_mode, spec)
 
-    # First check the normal versioned cache. Then check the durable cache, which
-    # survives script-version changes and is shared across target-model combinations.
     cached = INSTRUCTOR_CACHE.get(cache_key)
     if cached is not None:
-        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key} | prompt_type={prompt_type} | qmode={questionnaire_mode}")
-        if durable_key not in DURABLE_INSTRUCTOR_CACHE:
-            DURABLE_INSTRUCTOR_CACHE[durable_key] = cached
-            save_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE, DURABLE_INSTRUCTOR_CACHE)
+        logger.info(f"    instructor cache hit | case {case_id} | {instructor_key} | prompt_type={prompt_type}")
         return cached
 
-    durable_cached = DURABLE_INSTRUCTOR_CACHE.get(durable_key)
-    if durable_cached is not None:
-        logger.info(
-            f"    durable instructor cache hit | case {case_id} | {instructor_key} | "
-            f"prompt_type={prompt_type} | qmode={questionnaire_mode} | reused across targets/runs"
-        )
-        INSTRUCTOR_CACHE[cache_key] = durable_cached
-        save_json_cache(INSTRUCTOR_CACHE_FILE, INSTRUCTOR_CACHE)
-        return durable_cached
+    instructor_max_tokens = DEFAULT_INSTRUCTOR_MAX_TOKENS
+    if str(prompt_type) == "2" and spec.provider == "groq_chat":
+        # The pasted FPS script used max_tokens=400 for the Llama narrative.
+        # Using the normal 1800-token validation default makes the requested TPM much larger.
+        instructor_max_tokens = GROQ_TYPE2_INSTRUCTOR_MAX_OUTPUT_TOKENS
 
-    logger.info(f"    generating instructor prompt | case {case_id} | {instructor_key} | prompt_type={prompt_type} | qmode={questionnaire_mode} | compact={compact} | chars={len(system_prompt) + len(user_prompt)}")
+    logger.info(
+        f"    generating instructor prompt | case {case_id} | {instructor_key} | prompt_type={prompt_type} | "
+        f"compact={compact} | chars={len(system_prompt) + len(user_prompt)} | max_tokens={instructor_max_tokens}"
+    )
     text = call_model_text(
         spec=spec,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         logger=logger,
         purpose=f"instructor_prompt_case_{case_id}_ptype_{prompt_type}",
-        max_tokens=DEFAULT_INSTRUCTOR_MAX_TOKENS,
+        max_tokens=instructor_max_tokens,
         expected_scores=None,
     )
     INSTRUCTOR_CACHE[cache_key] = text
-    DURABLE_INSTRUCTOR_CACHE[durable_key] = text
     save_json_cache(INSTRUCTOR_CACHE_FILE, INSTRUCTOR_CACHE)
-    save_json_cache(DURABLE_INSTRUCTOR_CACHE_FILE, DURABLE_INSTRUCTOR_CACHE)
     return text
 
 def build_training_calibration(row: pd.Series) -> str:
@@ -2382,7 +2435,7 @@ def build_validation_system_prompt(
             "You are to answer as the person whose personality is represented by the information below.\n\n"
 
             "Treat the narrative profile as a high-level description of your own enduring personality. "
-            "Treat the labeled examples from items 1-120 as concrete evidence of how you, in this temporary adopted personality, "
+            f"Treat the labeled examples from {TRAIN_RANGE_LABEL} as concrete evidence of how you, in this temporary adopted personality, "
             "typically respond to questionnaire statements.\n\n"
 
             "When answering later items:\n"
@@ -2396,7 +2449,7 @@ def build_validation_system_prompt(
 
             "--- PERSONALITY NARRATIVE FROM THE 300-ITEM PROFILE ---\n"
             f"{instructor_prompt}\n\n"
-            "--- LABELED REFERENCE ITEMS (1-120) FOR THIS SAME ADOPTED PERSONA ---\n"
+            f"--- LABELED REFERENCE ITEMS ({TRAIN_RANGE_LABEL}) FOR THIS SAME ADOPTED PERSONA ---\n"
             f"{few_shot_prompt}"
         )
     else:
@@ -2473,7 +2526,6 @@ def build_target_batch_instruction(item_numbers: Sequence[int], prompt_type: str
     )
 
 
-
 def run_target_batches(
     row: pd.Series,
     system_prompt: str,
@@ -2485,35 +2537,19 @@ def run_target_batches(
 ) -> List[int]:
     spec = AVAILABLE_MODELS[target_key]
     case_id = str(row.get("case", "unknown"))
+    all_scores: List[int] = []
 
     effective_batch_size = batch_size
-    if spec.provider == "google_genai":
-        model_id_lower = spec.model_id.lower()
-        if model_id_lower.startswith("gemini-3"):
-            effective_batch_size = max(1, min(GEMINI3_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
+    if spec.provider == "groq_chat":
+        effective_batch_size = max(1, min(batch_size, LLAMA_TARGET_BATCH_SIZE))
+        if effective_batch_size != batch_size:
             logger.info(
-                f"    Gemini 3 target batch size: using {effective_batch_size} items per call "
-                f"instead of {batch_size}. Set GEMINI3_TARGET_BATCH_SIZE in .env to change this."
-            )
-        elif model_id_lower.startswith("gemma"):
-            effective_batch_size = max(1, min(GEMMA_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
-            logger.info(
-                f"    Gemma target batch size: using {effective_batch_size} items per call "
-                f"instead of {batch_size}. Set GEMMA_TARGET_BATCH_SIZE in .env to change this."
-            )
-        else:
-            effective_batch_size = max(1, min(GEMINI_TARGET_BATCH_SIZE, len(TEST_ITEMS)))
-            logger.info(
-                f"    Gemini target batch size: using {effective_batch_size} items per call "
-                f"instead of {batch_size}. Set GEMINI_TARGET_BATCH_SIZE in .env to change this."
+                f"    Llama/Groq target batch override: using {effective_batch_size} items per call "
+                f"instead of {batch_size}. Set LLAMA_TARGET_BATCH_SIZE in .env to change this."
             )
 
-    batch_groups: List[List[int]] = [
-        TEST_ITEMS[start:start + effective_batch_size]
-        for start in range(0, len(TEST_ITEMS), effective_batch_size)
-    ]
-
-    def run_one_batch(item_numbers: Sequence[int]) -> Tuple[int, List[int]]:
+    for start in range(0, len(TEST_ITEMS), effective_batch_size):
+        item_numbers = TEST_ITEMS[start:start + effective_batch_size]
         batch_label = f"case_{case_id}_items_{item_numbers[0]}_{item_numbers[-1]}"
         instruction = build_target_batch_instruction(item_numbers, prompt_type=prompt_type)
         expected_n = len(item_numbers)
@@ -2526,7 +2562,7 @@ def run_target_batches(
             "case_id": case_id,
             "instructor_key": instructor_key,
             "target_key": target_key,
-            "batch_items": list(item_numbers),
+            "batch_items": item_numbers,
             "system_prompt": system_prompt,
             "instruction": instruction,
         }, ensure_ascii=False, sort_keys=True))
@@ -2534,82 +2570,32 @@ def run_target_batches(
         cached = TARGET_BATCH_CACHE.get(cache_key)
         if cached is not None:
             logger.info(f"    target batch cache hit | {batch_label} | {target_key}")
-            return int(item_numbers[0]), list(cached)
+            all_scores.extend(cached)
+            continue
 
         logger.info(f"    target answering {batch_label} | {target_key}")
-        scores: Optional[List[int]] = None
-        last_parse_error: Optional[Exception] = None
-        for parse_attempt in range(TARGET_PARSE_RETRIES + 1):
-            raw = call_model_text(
-                spec=spec,
-                system_prompt=system_prompt,
-                user_prompt=instruction,
-                logger=logger,
-                purpose=f"target_scores_{batch_label}",
-                max_tokens=(
-                    DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
-                    if spec.provider.startswith("openai")
-                    else min(DEFAULT_GROQ_MAX_TOKENS, max(128, expected_n * 8 + 64))
-                    if spec.provider == "groq_chat"
-                    else min(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, max(2048, expected_n * 32 + 512))
-                    if spec.provider == "google_genai"
-                    else DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
-                ),
-                expected_scores=expected_n,
-            )
-            try:
-                scores = parse_scores_json(raw, expected_n, item_numbers=item_numbers)
-                break
-            except Exception as e:
-                last_parse_error = e
-                if parse_attempt < TARGET_PARSE_RETRIES:
-                    delay = 1.5 + parse_attempt * 1.5 + random.uniform(0, 0.5)
-                    logger.warning(
-                        f"    retry {parse_attempt + 1} for {batch_label} | {target_key} after parse error: {repr(e)} | waiting {delay:.1f}s"
-                    )
-                    time.sleep(delay)
-                    continue
-                raise
-
-        if scores is None:
-            raise RuntimeError(f"Target batch parsing failed: {repr(last_parse_error)}")
+        raw = call_model_text(
+            spec=spec,
+            system_prompt=system_prompt,
+            user_prompt=instruction,
+            logger=logger,
+            purpose=f"target_scores_{batch_label}",
+            max_tokens=(
+                DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
+                if spec.provider.startswith("openai")
+                else min(DEFAULT_GROQ_MAX_TOKENS, max(160, expected_n * 8))
+                if spec.provider == "groq_chat"
+                else DEFAULT_GEMINI_MAX_OUTPUT_TOKENS
+                if spec.provider == "google_genai"
+                else DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
+            ),
+            expected_scores=expected_n,
+        )
+        scores = parse_scores_json(raw, expected_n)
         TARGET_BATCH_CACHE[cache_key] = scores
         save_json_cache(TARGET_BATCH_CACHE_FILE, TARGET_BATCH_CACHE)
-        return int(item_numbers[0]), scores
-
-    def run_one_batch_adaptive(item_numbers: Sequence[int]) -> Tuple[int, List[int]]:
-        try:
-            return run_one_batch(item_numbers)
-        except Exception as e:
-            can_split = (
-                spec.provider == "google_genai"
-                and GOOGLE_ADAPTIVE_BATCH_SPLIT
-                and len(item_numbers) > GOOGLE_MIN_TARGET_BATCH_SIZE
-                and (
-                    isinstance(e, ValueError)
-                    or "expected" in str(e).lower()
-                    or "scores" in str(e).lower()
-                    or "parse" in str(e).lower()
-                    or "recover" in str(e).lower()
-                )
-            )
-            if not can_split:
-                raise
-            mid = len(item_numbers) // 2
-            left = list(item_numbers[:mid])
-            right = list(item_numbers[mid:])
-            logger.warning(
-                f"    Google target batch {item_numbers[0]}-{item_numbers[-1]} failed parsing; "
-                f"splitting into {left[0]}-{left[-1]} and {right[0]}-{right[-1]}"
-            )
-            left_start, left_scores = run_one_batch_adaptive(left)
-            _, right_scores = run_one_batch_adaptive(right)
-            return left_start, left_scores + right_scores
-
-    all_scores: List[int] = []
-    for item_numbers in batch_groups:
-        _, scores = run_one_batch_adaptive(item_numbers)
         all_scores.extend(scores)
+
         time.sleep(0.25)
 
     if len(all_scores) != len(TEST_ITEMS):
@@ -3539,63 +3525,24 @@ def expected_result_keys(df: pd.DataFrame, selection: Dict[str, List[str]]) -> s
 # =============================================================================
 
 def find_default_csv() -> Path:
-    """Return the only allowed validation dataset path.
-
-    This runner is locked to selected_50_raw_IPIP_NEO_300_items.csv.
-    It must sit beside this script unless the same filename is provided with --csv.
-    No fallback dataset is allowed.
-    """
-    if REQUIRED_DATASET_PATH.exists():
-        return REQUIRED_DATASET_PATH
+    candidates = [
+        SCRIPT_DIR / "IPIP_NEO_300.csv",
+        SCRIPT_DIR / "prosocial_antisocial_ipip300_answers.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
     raise FileNotFoundError(
-        f"Required validation dataset not found: {REQUIRED_DATASET_PATH}\n"
-        f"Place {REQUIRED_DATASET_NAME} in the same folder as this script. "
-        "No fallback CSV/Excel dataset will be used."
+        "Could not find IPIP_NEO_300.csv or prosocial_antisocial_ipip300_answers.csv beside the script. "
+        "Use --csv to provide a path."
     )
-
-def _read_excel_validation_data(path: Path) -> pd.DataFrame:
-    """Read an Excel workbook and choose the sheet containing i1-i300 columns when possible."""
-    workbook = pd.read_excel(path, sheet_name=None, engine="openpyxl")
-    if not workbook:
-        raise ValueError(f"Excel workbook has no readable sheets: {path}")
-
-    # Prefer the first sheet that contains all questionnaire columns. This lets the
-    # balanced-selection workbook safely include summary/detail sheets.
-    for sheet_name, sheet_df in workbook.items():
-        if all(col in sheet_df.columns for col in ALL_COLS):
-            return sheet_df
-
-    # Fallback to the first sheet, then let the missing-column check below give
-    # a clear error listing the missing i1-i300 columns.
-    first_sheet_name = next(iter(workbook))
-    return workbook[first_sheet_name]
 
 
 def load_data(csv_path: Path, max_participants: Optional[int]) -> pd.DataFrame:
-    csv_path = Path(csv_path).expanduser().resolve()
-    if csv_path.name != REQUIRED_DATASET_NAME:
-        raise RuntimeError(
-            f"This validation runner is locked to {REQUIRED_DATASET_NAME}. "
-            f"Refusing to load: {csv_path.name}"
-        )
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"Required validation dataset not found: {csv_path}. "
-            f"Place {REQUIRED_DATASET_NAME} beside this script."
-        )
-    suffix = csv_path.suffix.lower()
-    if suffix in {".xlsx", ".xlsm", ".xls"}:
-        df = _read_excel_validation_data(csv_path)
-    else:
-        df = pd.read_csv(csv_path)
-
+    df = pd.read_csv(csv_path)
     if "case" not in df.columns:
         if "profile_name" in df.columns:
             df = df.rename(columns={"profile_name": "case"})
-        elif "participant_id" in df.columns:
-            df = df.rename(columns={"participant_id": "case"})
-        elif "Participant" in df.columns:
-            df = df.rename(columns={"Participant": "case"})
         else:
             df["case"] = [str(i + 1) for i in range(len(df))]
     for optional in ["age", "sex", "country"]:
@@ -3605,10 +3552,7 @@ def load_data(csv_path: Path, max_participants: Optional[int]) -> pd.DataFrame:
 
     missing_cols = [col for col in ALL_COLS if col not in df.columns]
     if missing_cols:
-        raise ValueError(
-            f"Dataset {csv_path.name} is missing required item columns: "
-            f"{missing_cols[:10]} ... total={len(missing_cols)}"
-        )
+        raise ValueError(f"CSV is missing required item columns: {missing_cols[:10]} ... total={len(missing_cols)}")
 
     if max_participants is not None:
         df = df.head(max_participants)
@@ -3667,7 +3611,7 @@ def process_case_pair(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run multi-model IPIP-NEO-300 validation.")
-    parser.add_argument("--csv", type=str, default=None, help="Path to validation dataset. Must be selected_50_raw_IPIP_NEO_300_items.csv. No fallback datasets are allowed.")
+    parser.add_argument("--csv", type=str, default=None, help="Path to IPIP_NEO_300.csv or equivalent.")
     parser.add_argument("--max-participants", type=str, default=None, help="Number of participants, or 'all'. If omitted, asks interactively.")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Target item batch size. Default: 30.")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory. Default: validation_outputs/run_TIMESTAMP")
@@ -3702,6 +3646,7 @@ def main() -> None:
     manifest = load_json_file(output_dir / RUN_MANIFEST_FILENAME) if resume_previous else None
 
     # Configure the selected questionnaire split before data loading and processing.
+    # Prompt Type 2 now also respects this split; for 180-120 it uses the same FPS wording adapted to the selected item range.
     configure_questionnaire_split(str(selection.get("questionnaire_mode", "120-180")))
 
     validate_environment(selection)
@@ -3710,13 +3655,8 @@ def main() -> None:
         max_participants = manifest.get("max_participants", DEFAULT_MAX_PARTICIPANTS)
         batch_size = int(manifest.get("batch_size", args.batch_size))
         case_plots = bool(manifest.get("case_plots", args.case_plots))
-        csv_path = Path(args.csv).expanduser().resolve() if args.csv else find_default_csv()
-        if csv_path.name != REQUIRED_DATASET_NAME:
-            raise RuntimeError(
-                f"This validation runner is locked to {REQUIRED_DATASET_NAME}. "
-                f"Resume manifest/--csv tried to use: {csv_path.name}"
-            )
-        logger.info("Resume mode: using previous participant count, batch size, and model selection; dataset forced to selected_50_raw_IPIP_NEO_300_items.csv.")
+        csv_path = Path(manifest.get("csv_path")).expanduser().resolve() if manifest.get("csv_path") else (Path(args.csv).expanduser().resolve() if args.csv else find_default_csv())
+        logger.info("Resume mode: using previous CSV, participant count, batch size, and model selection.")
     else:
         if args.max_participants is None:
             max_participants = ask_max_participants(DEFAULT_MAX_PARTICIPANTS)
